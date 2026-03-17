@@ -1,6 +1,5 @@
 import sys, time
-sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/Autonomous-Ai-drone-scripts/modules')
-
+sys.path.insert(1,'/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/modules')
 import drone
 
 #debug
