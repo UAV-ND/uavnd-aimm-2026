@@ -1,18 +1,33 @@
 import sys, time
-sys.path.insert(1, 'modules')
-
+sys.path.insert(1,'/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/modules')
 import drone
 
+#debug
+#print("Mode:", drone.get_mode())
+#print("Version:", drone.get_version())
+
 #config 
-height = 10
+height = 1
 speed = 3 #m/s
 size = 165 #10 meter  
 #end config
 
-drone.connect_drone('/dev/ttyACM0')
-#drone.connect_drone('127.0.0.1:14551')
+#drone.connect_drone('/dev/ttyACM0')
+#drone.connect_drone('udp127.0.0.1:14550')
+#drone.connect_drone('udp:127.0.0.1:14552')
+#drone.connect_drone('udpin:127.0.0.1:14552')
+v = drone.connect_drone('udpin:127.0.0.1:14552')
+print("Connected:", v is not None)
+print("Mode:", v.mode)
 
+print("Mode:", drone.vehicle.mode if hasattr(drone, "vehicle") else "n/a")
+print("Armed:", drone.vehicle.armed if hasattr(drone, "vehicle") else "n/a")
 drone.arm_and_takeoff(height)
+#drone.connect_drone('udp:127.0.0.1:14551')
+
+print(drone.get_version())
+print(drone.get_mode())
+print(drone.get_location())
 
 time.sleep(5)
 

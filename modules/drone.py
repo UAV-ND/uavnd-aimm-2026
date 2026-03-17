@@ -1,17 +1,39 @@
 from dronekit import *
+import time
+from pymavlink import mavutil
 
 vehicle = None 
 
 # Connect to the Vehicle (in this case a UDP endpoint)
-def connect_drone(connection_string, waitready=True, baudrate=57600):
+def connect_drone_og(connection_string, waitready=True, baudrate=57600):
     global vehicle
     if vehicle == None:
         vehicle = connect(connection_string, wait_ready=waitready, baud=baudrate)
     print("drone connected")
 
-def disconnect_drone():
-    vehicle.close()
+def connect_drone(connection_string, waitready=True, baudrate=None):
+    global vehicle
 
+    vehicle = connect(
+        connection_string,
+        wait_ready=False,     # connect first, don't block
+        baud=baudrate,
+        heartbeat_timeout=60
+    )
+
+    # Optional: wait for a minimal set of attributes with more time
+    try:
+        vehicle.wait_ready('mode', 'armed', 'attitude', timeout=120)
+    except Exception as e:
+        print(f"[WARN] wait_ready minimal timed out: {e}")
+
+    return vehicle
+
+def disconnect_drone():
+    global vehicle
+    if vehicle is not None:
+       vehicle.close()
+       vehicle = None
 def get_version():
     global vehicle
     return vehicle.version
@@ -125,9 +147,20 @@ def arm_and_takeoff(aTargetAltitude):
     vehicle.groundspeed = 3
 
     print ("Basic pre-arm checks")
+
+    print("System status:", vehicle.system_status.state)
+    print("EKF ok:", getattr(vehicle, "ekf_ok", None))
+    print("GPS fix:", vehicle.gps_0.fix_type, "sats:", vehicle.gps_0.satellites_visible)
+    print("Last heartbeat:", vehicle.last_heartbeat)
+
     # Don't try to arm until autopilot is ready
     while not vehicle.is_armable:
         print (" Waiting for vehicle to initialise...")
+        print(" is_armable:", vehicle.is_armable,
+              "| system_status:", vehicle.system_status.state,
+              "| ekf_ok:", getattr(vehicle, "ekf_ok", None),
+              "| gps_fix:", vehicle.gps_0.fix_type,
+              "| sats:", vehicle.gps_0.satellites_visible)
         time.sleep(1)
 
     print ("Arming motors")
@@ -190,7 +223,7 @@ def send_movement_command_YAW(heading):
     vehicle.send_mavlink(msg)
     #Vehicle.commands.flush()
 
-def send_movement_command_XYA(velocity_x, velocity_y, altitude):
+def send_movement_command_XYZ(velocity_x, velocity_y, altitude):
     global vehicle
 
     #velocity_x positive = forward. negative = backwards
