@@ -4,16 +4,16 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
-ENGINE_PATH = "best_fp16.engine"
-CLASS_NAMES = ["Black buoy", "Target"]
+ENGINE_PATH = "engine.engine"
+CLASS_NAMES = ["black_bottle"]
 
 INPUT_W = 640
 INPUT_H = 640
 
-CONF_THRES = 0.40
-NMS_THRES = 0.45
+CONF_THRES = 0.82
+NMS_THRES = 0.35
 
-TRIGGER_CONF = 0.70
+TRIGGER_CONF = 0.90
 TRIGGER_FRAMES = 5
 
 
@@ -120,7 +120,7 @@ def nms(boxes, scores, iou_thres):
 def postprocess(output, orig_img, r, dw, dh):
     h0, w0 = orig_img.shape[:2]
 
-    preds = output.reshape(1, 6, 8400)[0]   # (6, 8400)
+    preds = output.reshape(1, 5, 8400)[0]   # (6, 8400)
     preds = preds.T                         # (8400, 6)
 
     boxes = []
@@ -204,6 +204,13 @@ class TensorRTInfer(object):
         self.cuda_outputs = []
 
         for i in range(self.engine.num_bindings):
+            print(
+        	"binding", i,
+        	"name=", self.engine.get_binding_name(i),
+        	"shape=", self.engine.get_binding_shape(i),
+        	"dtype=", self.engine.get_binding_dtype(i),
+        	"is_input=", self.engine.binding_is_input(i)
+	    )
             shape = self.engine.get_binding_shape(i)
             size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(i))
@@ -259,7 +266,22 @@ def main():
         output = trt_infer.infer(inp)
         detections = postprocess(output, frame, r, dw, dh)
 
+	#keep single best detection
+        best_det = None
+        best_score = 0.0
+
+        for box, score, class_id in detections:
+             if score > best_score:
+                best_score = score
+                best_det = (box, score, class_id)
+
+        if best_det is not None:
+           detections = [best_det]
+        else:
+           detections = []
+
         confirmed = False
+
         for box, score, class_id in detections:
             if score >= TRIGGER_CONF:
                 confirmed = True

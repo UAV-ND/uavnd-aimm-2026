@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys, time
 import argparse
 sys.path.insert(1, 'modules')
