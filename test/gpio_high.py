@@ -7,7 +7,7 @@ import time
 GPIO.setmode(GPIO.BOARD)
 
 # Choose the pin (example: pin 12)
-PIN = 12
+PIN = 16
 
 try:
     # Setup pin as output

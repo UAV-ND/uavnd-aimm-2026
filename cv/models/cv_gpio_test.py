@@ -1,8 +1,12 @@
+#!/usr/bin/env python3
+
 import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+import Jetson.GPIO as GPIO
+import time
 
 ENGINE_PATH = "engine.engine"
 CLASS_NAMES = ["black_bottle"]
@@ -14,7 +18,46 @@ CONF_THRES = 0.93
 NMS_THRES = 0.35
 
 TRIGGER_CONF = 0.97
-TRIGGER_FRAMES = 12
+TRIGGER_FRAMES = 5
+
+MIN_BOX_W = 50
+MIN_BOX_H = 50
+MIN_BOX_AREA = 3000
+
+CENTER_GATE_X = 0.45   # fraction of image width
+CENTER_GATE_Y = 0.45   # fraction of image height
+
+STABLE_DIST_PX = 40
+AREA_RATIO_MIN = 0.70
+AREA_RATIO_MAX = 1.40
+
+SMOOTH_ALPHA = 0.2
+
+PAYLOAD_PIN = 16
+PAYLOAD_PULSE_S = 0.5
+TRIGGER_COOLDOWN_S = 3.0
+ENABLE_GPIO_TRIGGER = True   # set True only when ready
+
+
+def setup_gpio():
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(PAYLOAD_PIN, GPIO.OUT)
+    GPIO.output(PAYLOAD_PIN, GPIO.LOW)
+
+
+def cleanup_gpio():
+    try:
+        GPIO.output(PAYLOAD_PIN, GPIO.LOW)
+    except:
+        pass
+    GPIO.cleanup()
+
+
+def trigger_payload(pin=PAYLOAD_PIN, pulse_s=PAYLOAD_PULSE_S):
+    print("TRIGGERING PAYLOAD on pin", pin)
+    GPIO.output(pin, GPIO.HIGH)
+    time.sleep(pulse_s)
+    GPIO.output(pin, GPIO.LOW)
 
 
 def gstreamer_pipeline(
@@ -73,8 +116,8 @@ def preprocess(frame):
     img, r, dw, dh = letterbox(frame, (INPUT_H, INPUT_W))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-    img = np.expand_dims(img, axis=0)   # CHW -> NCHW
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
     img = np.ascontiguousarray(img)
     return img, r, dw, dh
 
@@ -119,9 +162,11 @@ def nms(boxes, scores, iou_thres):
 
 def postprocess(output, orig_img, r, dw, dh):
     h0, w0 = orig_img.shape[:2]
+    img_cx = w0 / 2.0
+    img_cy = h0 / 2.0
 
-    preds = output.reshape(1, 5, 8400)[0]   # (6, 8400)
-    preds = preds.T                         # (8400, 6)
+    preds = output.reshape(1, 5, 8400)[0]
+    preds = preds.T
 
     boxes = []
     scores = []
@@ -142,7 +187,6 @@ def postprocess(output, orig_img, r, dw, dh):
         x2 = cx + w / 2.0
         y2 = cy + h / 2.0
 
-        # undo letterbox
         x1 = (x1 - dw) / r
         y1 = (y1 - dh) / r
         x2 = (x2 - dw) / r
@@ -156,20 +200,32 @@ def postprocess(output, orig_img, r, dw, dh):
         if x2 <= x1 or y2 <= y1:
             continue
 
+        bw = x2 - x1
+        bh = y2 - y1
+        area = bw * bh
+
+        if bw < MIN_BOX_W or bh < MIN_BOX_H:
+            continue
+        if area < MIN_BOX_AREA:
+            continue
+
+        box_cx = (x1 + x2) / 2.0
+        box_cy = (y1 + y2) / 2.0
+
+        if abs(box_cx - img_cx) > CENTER_GATE_X * w0:
+            continue
+        if abs(box_cy - img_cy) > CENTER_GATE_Y * h0:
+            continue
+
         boxes.append([x1, y1, x2, y2])
         scores.append(score)
         class_ids.append(class_id)
 
     keep = nms(boxes, scores, NMS_THRES)
-
-    detections = []
-    for i in keep:
-        detections.append((boxes[i], scores[i], class_ids[i]))
-
-    return detections
+    return [(boxes[i], scores[i], class_ids[i]) for i in keep]
 
 
-def draw_detections(image, detections):
+def draw_detections(image, detections, stable_counter=0, smooth_center=None):
     for box, score, class_id in detections:
         x1, y1, x2, y2 = [int(v) for v in box]
         label = "{} {:.2f}".format(CLASS_NAMES[class_id], score)
@@ -184,6 +240,21 @@ def draw_detections(image, detections):
             (0, 255, 0),
             2,
         )
+
+    cv2.putText(
+        image,
+        "stable_counter={}".format(stable_counter),
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2,
+    )
+
+    if smooth_center is not None:
+        scx, scy = int(smooth_center[0]), int(smooth_center[1])
+        cv2.circle(image, (scx, scy), 6, (0, 0, 255), -1)
+
     return image
 
 
@@ -205,12 +276,13 @@ class TensorRTInfer(object):
 
         for i in range(self.engine.num_bindings):
             print(
-        	"binding", i,
-        	"name=", self.engine.get_binding_name(i),
-        	"shape=", self.engine.get_binding_shape(i),
-        	"dtype=", self.engine.get_binding_dtype(i),
-        	"is_input=", self.engine.binding_is_input(i)
-	    )
+                "binding", i,
+                "name=", self.engine.get_binding_name(i),
+                "shape=", self.engine.get_binding_shape(i),
+                "dtype=", self.engine.get_binding_dtype(i),
+                "is_input=", self.engine.binding_is_input(i)
+            )
+
             shape = self.engine.get_binding_shape(i)
             size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(i))
@@ -242,19 +314,27 @@ def main():
     print("Loading TensorRT engine:", ENGINE_PATH)
     trt_infer = TensorRTInfer(ENGINE_PATH)
 
+    setup_gpio()
+
     pipeline = gstreamer_pipeline(flip_method=0)
     print("Using pipeline:")
     print(pipeline)
 
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-
     if not cap.isOpened():
         print("Unable to open camera")
         return
 
     cv2.namedWindow("CSI TensorRT Detection", cv2.WINDOW_AUTOSIZE)
 
-    target_counter = 0
+    prev_center = None
+    prev_area = None
+    stable_counter = 0
+
+    smooth_cx = None
+    smooth_cy = None
+
+    last_trigger_time = 0.0
 
     while cv2.getWindowProperty("CSI TensorRT Detection", 0) >= 0:
         ret, frame = cap.read()
@@ -266,38 +346,83 @@ def main():
         output = trt_infer.infer(inp)
         detections = postprocess(output, frame, r, dw, dh)
 
-	#keep single best detection
         best_det = None
         best_score = 0.0
 
         for box, score, class_id in detections:
-             if score > best_score:
+            if score > best_score:
                 best_score = score
                 best_det = (box, score, class_id)
 
         if best_det is not None:
-           detections = [best_det]
+            detections = [best_det]
         else:
-           detections = []
+            detections = []
 
         confirmed = False
+        smooth_center = None
 
-        for box, score, class_id in detections:
-            if score >= TRIGGER_CONF:
-                confirmed = True
-                print("DETECTED:", CLASS_NAMES[class_id], "conf=", round(score, 3))
+        if len(detections) == 1:
+            box, score, class_id = detections[0]
+            x1, y1, x2, y2 = box
 
-        if confirmed:
-            target_counter += 1
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            area = (x2 - x1) * (y2 - y1)
+
+            if smooth_cx is None:
+                smooth_cx, smooth_cy = cx, cy
+            else:
+                smooth_cx = SMOOTH_ALPHA * cx + (1.0 - SMOOTH_ALPHA) * smooth_cx
+                smooth_cy = SMOOTH_ALPHA * cy + (1.0 - SMOOTH_ALPHA) * smooth_cy
+
+            smooth_center = (smooth_cx, smooth_cy)
+
+            if prev_center is not None and prev_area is not None:
+                dist = ((cx - prev_center[0]) ** 2 + (cy - prev_center[1]) ** 2) ** 0.5
+                area_ratio = area / max(prev_area, 1.0)
+
+                if score >= TRIGGER_CONF and dist < STABLE_DIST_PX and AREA_RATIO_MIN < area_ratio < AREA_RATIO_MAX:
+                    stable_counter += 1
+                    confirmed = True
+                else:
+                    stable_counter = 0
+            else:
+                stable_counter = 1 if score >= TRIGGER_CONF else 0
+                confirmed = score >= TRIGGER_CONF
+
+            prev_center = (cx, cy)
+            prev_area = area
+
+            print(
+                "DETECTED:",
+                CLASS_NAMES[class_id],
+                "conf=", round(score, 3),
+                "box=",
+                [int(x1), int(y1), int(x2), int(y2)],
+                "stable=",
+                stable_counter
+            )
         else:
-            target_counter = 0
+            stable_counter = 0
+            prev_center = None
+            prev_area = None
+            smooth_cx = None
+            smooth_cy = None
 
-        if target_counter >= TRIGGER_FRAMES:
+        now = time.time()
+        if stable_counter >= TRIGGER_FRAMES and (now - last_trigger_time) > TRIGGER_COOLDOWN_S:
             print("CONFIRMED TARGET EVENT")
-            # TODO: trigger payload here
-            target_counter = 0
 
-        vis = draw_detections(frame.copy(), detections)
+            if ENABLE_GPIO_TRIGGER:
+                trigger_payload()
+            else:
+                print("GPIO trigger disabled; dry run only")
+
+            last_trigger_time = now
+            stable_counter = 0
+
+        vis = draw_detections(frame.copy(), detections, stable_counter, smooth_center)
         cv2.imshow("CSI TensorRT Detection", vis)
 
         key = cv2.waitKey(1) & 0xFF
@@ -306,6 +431,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    cleanup_gpio()
 
 
 if __name__ == "__main__":
@@ -314,3 +440,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nStopped by Ctrl+C")
         cv2.destroyAllWindows()
+        cleanup_gpio()
