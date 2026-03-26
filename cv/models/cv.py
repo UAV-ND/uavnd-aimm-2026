@@ -27,9 +27,9 @@ MIN_BOX_AREA = 3000
 CENTER_GATE_X = 0.48
 CENTER_GATE_Y = 0.48
 
-STABLE_DIST_PX = 80
-AREA_RATIO_MIN = 0.60
-AREA_RATIO_MAX = 1.60
+STABLE_DIST_PX = 100
+AREA_RATIO_MIN = 0.55
+AREA_RATIO_MAX = 1.80
 
 SMOOTH_ALPHA = 0.12
 
@@ -38,12 +38,18 @@ PAYLOAD_PULSE_S = 0.5
 TRIGGER_COOLDOWN_S = 3.0
 ENABLE_GPIO_TRIGGER = True
 
-# Motion robustness settings
 DETECT_EVERY_N_FRAMES = 3
 MAX_LOST_FRAMES = 6
+
+FLOW_MIN_POINTS = 6
+FLOW_MAX_CORNERS = 60
+FLOW_QUALITY_LEVEL = 0.2
+FLOW_MIN_DISTANCE = 7
+FLOW_BLOCK_SIZE = 7
+FLOW_MAX_JUMP_PX = 160
+
 TRACKER_MIN_BOX_W = 40
 TRACKER_MIN_BOX_H = 40
-TRACKER_MAX_JUMP_PX = 140
 
 
 def setup_gpio():
@@ -232,16 +238,6 @@ def postprocess(output, orig_img, r, dw, dh):
     return [(boxes[i], scores[i], class_ids[i]) for i in keep]
 
 
-def xyxy_to_xywh(box):
-    x1, y1, x2, y2 = box
-    return (float(x1), float(y1), float(x2 - x1), float(y2 - y1))
-
-
-def xywh_to_xyxy(box):
-    x, y, w, h = box
-    return [float(x), float(y), float(x + w), float(y + h)]
-
-
 def clip_box_xyxy(box, frame_shape):
     h0, w0 = frame_shape[:2]
     x1, y1, x2, y2 = box
@@ -249,7 +245,12 @@ def clip_box_xyxy(box, frame_shape):
     y1 = max(0, min(y1, h0 - 1))
     x2 = max(0, min(x2, w0 - 1))
     y2 = max(0, min(y2, h0 - 1))
-    return [x1, y1, x2, y2]
+    return [float(x1), float(y1), float(x2), float(y2)]
+
+
+def xyxy_to_xywh(box):
+    x1, y1, x2, y2 = box
+    return [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
 
 def box_center_area(box):
@@ -260,46 +261,116 @@ def box_center_area(box):
     return cx, cy, area
 
 
-def is_reasonable_tracked_box(box, frame_shape):
+def is_reasonable_box(box, frame_shape):
     x1, y1, x2, y2 = box
     bw = x2 - x1
     bh = y2 - y1
-    if bw < TRACKER_MIN_BOX_W or bh < TRACKER_MIN_BOX_H:
-        return False
+
     if x2 <= x1 or y2 <= y1:
+        return False
+    if bw < TRACKER_MIN_BOX_W or bh < TRACKER_MIN_BOX_H:
         return False
 
     h0, w0 = frame_shape[:2]
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
 
-    if abs(cx - (w0 / 2.0)) > 0.55 * w0:
+    if abs(cx - (w0 / 2.0)) > 0.58 * w0:
         return False
-    if abs(cy - (h0 / 2.0)) > 0.55 * h0:
+    if abs(cy - (h0 / 2.0)) > 0.58 * h0:
         return False
 
     return True
 
 
-def create_tracker():
-    # Prefer CSRT; fallback to KCF depending on OpenCV build
-    if hasattr(cv2, "TrackerCSRT_create"):
-        print("Using OpenCV CSRT tracker")
-        return cv2.TrackerCSRT_create()
+class OpticalFlowTracker:
+    def __init__(self):
+        self.prev_gray = None
+        self.points = None
+        self.box_xyxy = None
 
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
-        print("Using OpenCV legacy CSRT tracker")
-        return cv2.legacy.TrackerCSRT_create()
+    def init(self, frame, box_xyxy):
+        self.box_xyxy = [float(v) for v in box_xyxy]
+        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.points = self._extract_points(self.prev_gray, self.box_xyxy)
 
-    if hasattr(cv2, "TrackerKCF_create"):
-        print("Using OpenCV KCF tracker")
-        return cv2.TrackerKCF_create()
+    def _extract_points(self, gray, box_xyxy):
+        x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(gray.shape[1] - 1, x2)
+        y2 = min(gray.shape[0] - 1, y2)
 
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
-        print("Using OpenCV legacy KCF tracker")
-        return cv2.legacy.TrackerKCF_create()
+        if x2 <= x1 or y2 <= y1:
+            return None
 
-    raise RuntimeError("No supported OpenCV tracker found (CSRT/KCF unavailable)")
+        roi = gray[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        p0 = cv2.goodFeaturesToTrack(
+            roi,
+            maxCorners=FLOW_MAX_CORNERS,
+            qualityLevel=FLOW_QUALITY_LEVEL,
+            minDistance=FLOW_MIN_DISTANCE,
+            blockSize=FLOW_BLOCK_SIZE,
+        )
+
+        if p0 is None:
+            return None
+
+        p0[:, 0, 0] += x1
+        p0[:, 0, 1] += y1
+        return p0
+
+    def refresh_points(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.prev_gray = gray
+        self.points = self._extract_points(gray, self.box_xyxy)
+
+    def update(self, frame):
+        if self.prev_gray is None or self.points is None:
+            return False, None
+
+        if len(self.points) < FLOW_MIN_POINTS:
+            self.refresh_points(frame)
+            if self.points is None or len(self.points) < FLOW_MIN_POINTS:
+                return False, None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        p1, st, err = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray,
+            gray,
+            self.points,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+
+        if p1 is None or st is None:
+            return False, None
+
+        good_new = p1[st == 1]
+        good_old = self.points[st == 1]
+
+        if len(good_new) < FLOW_MIN_POINTS:
+            self.prev_gray = gray
+            self.points = good_new.reshape(-1, 1, 2) if len(good_new) > 0 else None
+            return False, None
+
+        dx = float(np.median(good_new[:, 0] - good_old[:, 0]))
+        dy = float(np.median(good_new[:, 1] - good_old[:, 1]))
+
+        x1, y1, x2, y2 = self.box_xyxy
+        new_box = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
+
+        self.prev_gray = gray
+        self.points = good_new.reshape(-1, 1, 2)
+        self.box_xyxy = new_box
+
+        return True, new_box
 
 
 def draw_detections(
@@ -416,61 +487,6 @@ class TensorRTInfer(object):
 
         return self.host_outputs[0]
 
-class OpticalFlowTracker:
-    def __init__(self):
-        self.prev_gray = None
-        self.points = None
-
-    def init(self, frame, box):
-        x, y, w, h = map(int, box)
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        roi = gray[y:y+h, x:x+w]
-
-        p0 = cv2.goodFeaturesToTrack(
-            roi,
-            maxCorners=50,
-            qualityLevel=0.3,
-            minDistance=7,
-            blockSize=7
-        )
-
-        if p0 is not None:
-            p0[:, 0, 0] += x
-            p0[:, 0, 1] += y
-
-        self.prev_gray = gray
-        self.points = p0
-
-    def update(self, frame):
-        if self.points is None:
-            return False, None
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        p1, st, err = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray,
-            gray,
-            self.points,
-            None
-        )
-
-        if p1 is None:
-            return False, None
-
-        good_new = p1[st == 1]
-        good_old = self.points[st == 1]
-
-        if len(good_new) < 5:
-            return False, None
-
-        dx = np.mean(good_new[:, 0] - good_old[:, 0])
-        dy = np.mean(good_new[:, 1] - good_old[:, 1])
-
-        self.points = good_new.reshape(-1, 1, 2)
-        self.prev_gray = gray
-
-        return True, (dx, dy)
 
 def main():
     print("Loading TensorRT engine:", ENGINE_PATH)
@@ -515,29 +531,26 @@ def main():
             break
 
         frame_idx += 1
-
         best_det = None
         best_score = 0.0
         mode_text = "TRACK" if tracker_active else "SEARCH"
         used_tracker_this_frame = False
 
-        # 1) Tracker update every frame if active
         if tracker_active and tracker is not None:
-            ok, tracked_box_xywh = tracker.update(frame)
+            ok, tracked_box_xyxy = tracker.update(frame)
 
             if ok:
-                tracked_box_xyxy = clip_box_xyxy(
-                    xywh_to_xyxy(tracked_box_xywh),
-                    frame.shape
-                )
+                tracked_box_xyxy = clip_box_xyxy(tracked_box_xyxy, frame.shape)
 
-                if is_reasonable_tracked_box(tracked_box_xyxy, frame.shape):
+                if is_reasonable_box(tracked_box_xyxy, frame.shape):
                     if tracker_box_xyxy is not None:
                         cx_new, cy_new, _ = box_center_area(tracked_box_xyxy)
                         cx_old, cy_old, _ = box_center_area(tracker_box_xyxy)
                         jump = ((cx_new - cx_old) ** 2 + (cy_new - cy_old) ** 2) ** 0.5
-                        if jump <= TRACKER_MAX_JUMP_PX:
+
+                        if jump <= FLOW_MAX_JUMP_PX:
                             tracker_box_xyxy = tracked_box_xyxy
+                            tracker.box_xyxy = tracker_box_xyxy
                             best_det = (tracker_box_xyxy, tracker_score, tracker_class_id)
                             lost_frames = 0
                             used_tracker_this_frame = True
@@ -545,6 +558,7 @@ def main():
                             lost_frames += 1
                     else:
                         tracker_box_xyxy = tracked_box_xyxy
+                        tracker.box_xyxy = tracker_box_xyxy
                         best_det = (tracker_box_xyxy, tracker_score, tracker_class_id)
                         lost_frames = 0
                         used_tracker_this_frame = True
@@ -567,7 +581,6 @@ def main():
                 smooth_cy = None
                 mode_text = "SEARCH"
 
-        # 2) Periodic detector update, or always when tracker is inactive
         should_detect = (not tracker_active) or (frame_idx % DETECT_EVERY_N_FRAMES == 0)
 
         if should_detect:
@@ -583,26 +596,42 @@ def main():
             if best_det is not None:
                 det_box, det_score, det_class_id = best_det
 
-                # If tracker is inactive, acquire target
                 if not tracker_active:
-                    tracker = create_tracker()
-                    tracker.init(frame, xyxy_to_xywh(det_box))
-                    tracker_active = True
-                    tracker_box_xyxy = det_box
-                    tracker_score = det_score
-                    tracker_class_id = det_class_id
-                    lost_frames = 0
-                    mode_text = "DETECT+TRACK"
-                    print("Acquired target from detector")
+                    tracker = OpticalFlowTracker()
+                    tracker.init(frame, det_box)
+
+                    if tracker.points is not None and len(tracker.points) >= FLOW_MIN_POINTS:
+                        tracker_active = True
+                        tracker_box_xyxy = det_box
+                        tracker_score = det_score
+                        tracker_class_id = det_class_id
+                        lost_frames = 0
+                        mode_text = "DETECT+FLOW"
+                        print("Acquired target from detector")
+                    else:
+                        tracker = None
+                        tracker_active = False
+                        tracker_box_xyxy = det_box
+                        tracker_score = det_score
+                        tracker_class_id = det_class_id
+                        mode_text = "DETECT_ONLY"
                 else:
-                    # If tracker already active, detector refreshes the tracker
-                    tracker = create_tracker()
-                    tracker.init(frame, xyxy_to_xywh(det_box))
-                    tracker_box_xyxy = det_box
-                    tracker_score = det_score
-                    tracker_class_id = det_class_id
-                    lost_frames = 0
-                    mode_text = "REFRESH_TRACK"
+                    tracker = OpticalFlowTracker()
+                    tracker.init(frame, det_box)
+
+                    if tracker.points is not None and len(tracker.points) >= FLOW_MIN_POINTS:
+                        tracker_box_xyxy = det_box
+                        tracker_score = det_score
+                        tracker_class_id = det_class_id
+                        lost_frames = 0
+                        mode_text = "REFRESH_FLOW"
+                    else:
+                        tracker = None
+                        tracker_active = False
+                        tracker_box_xyxy = det_box
+                        tracker_score = det_score
+                        tracker_class_id = det_class_id
+                        mode_text = "DETECT_ONLY"
 
                 used_tracker_this_frame = False
             else:
@@ -610,9 +639,7 @@ def main():
                     best_det = None
                     mode_text = "SEARCH"
 
-        # Build display detections
         display_detections = [best_det] if best_det is not None else []
-
         smooth_center = None
 
         if best_det is not None:
@@ -635,13 +662,15 @@ def main():
                 dist = ((cx - prev_center[0]) ** 2 + (cy - prev_center[1]) ** 2) ** 0.5
                 area_ratio = area / max(prev_area, 1.0)
 
-                # For tracker frames, allow a little more tolerance
                 effective_trigger_conf = TRIGGER_CONF if not used_tracker_this_frame else (TRIGGER_CONF - 0.02)
 
-                if score >= effective_trigger_conf and dist < STABLE_DIST_PX and AREA_RATIO_MIN < area_ratio < AREA_RATIO_MAX:
+                if (
+                    score >= effective_trigger_conf
+                    and dist < STABLE_DIST_PX
+                    and AREA_RATIO_MIN < area_ratio < AREA_RATIO_MAX
+                ):
                     stable_counter += 1
                 else:
-                    # decay instead of hard reset for motion tolerance
                     stable_counter = max(0, stable_counter - 1)
             else:
                 stable_counter = 1 if score >= TRIGGER_CONF else 0
