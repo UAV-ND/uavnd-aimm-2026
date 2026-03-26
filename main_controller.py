@@ -52,8 +52,8 @@ DESCENT_MARKER_LOST_TIMEOUT = 5
 
 # --- Setup ---
 def setup():
-    log.info("Connecting lidar...")
-    lidar.connect_lidar("/dev/ttyTHS1")
+    #log.info("Connecting lidar...")
+    #lidar.connect_lidar("/dev/ttyTHS1")
 
     log.info("Setting up detector...")
     detector.initialize_detector()
