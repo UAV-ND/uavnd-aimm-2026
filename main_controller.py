@@ -59,12 +59,9 @@ def setup():
     detector.initialize_detector()
 
     log.info("Connecting to drone...")
-    if args.mode == "flight":
-        log.info("MODE = flight")
-        control.connect_drone('/dev/ttyACM0')
-    else:
-        log.info("MODE = test")
-        control.connect_drone('127.0.0.1:14551')
+    v = drone.connect_drone('udpin:127.0.0.1:14552')
+    log.info(f"Connected: {v is not None}")
+    
 
     control.set_flight_altitude(MAX_ALT)
     control.configure_PID(args.control)
