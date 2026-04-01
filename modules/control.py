@@ -1,128 +1,217 @@
-from logging import debug
 from modules import drone
 from simple_pid import PID
 import time
 
-USE_PID_YAW = True
-USE_PID_ROLL = False
+MAX_VEL_FORWARD = 1.0
+MAX_VEL_RIGHT = 1.0
 
-MAX_SPEED = 4       # M / s
-MAX_YAW = 15        # Degrees / s 
+P_X = 0.008
+I_X = 0.0
+D_X = 0.0
 
-P_YAW = 0.02 #orgineel 0.01
-I_YAW = 0
-D_YAW = 0
+P_Y = 0.008
+I_Y = 0.0
+D_Y = 0.0
 
-P_ROLL = 0.22
-I_ROLL = 0
-D_ROLL = 0
+pid_x = None
+pid_y = None
 
-control_loop_active = True
-pidYaw = None
-pidRoll = None
-movementYawAngle = 0
-movementRollAngle = 0
-inputValueYaw = 0
-inputValueVelocityX = 0
-control_loop_active = True
-flight_altitude = 4
+input_err_x = 0.0
+input_err_y = 0.0
 
-debug_yaw = None
-debug_velocity = None
+cmd_vel_forward = 0.0
+cmd_vel_right = 0.0
+
+flight_altitude = 4.0
+state = "idle"
 
 
-def configure_PID(control):
-    global pidRoll,pidYaw
+def configure_PID(control="PID"):
+    global pid_x, pid_y
 
-    """ Creates a new PID object depending on whether or not the PID or P is used """ 
-
-    print("Configuring control")
-
-    if control == 'PID':
-        pidYaw = PID(P_YAW, I_YAW, D_YAW, setpoint=0)       # I = 0.001
-        pidYaw.output_limits = (-MAX_YAW, MAX_YAW)          # PID Range
-        pidRoll = PID(P_ROLL, I_ROLL, D_ROLL, setpoint=0)   # I = 0.001
-        pidRoll.output_limits = (-MAX_SPEED, MAX_SPEED)     # PID Range
-        print("Configuring PID")
+    if control == "PID":
+        pid_x = PID(P_X, I_X, D_X, setpoint=0)
+        pid_y = PID(P_Y, I_Y, D_Y, setpoint=0)
     else:
-        pidYaw = PID(P_YAW, 0, 0, setpoint=0)               # I = 0.001
-        pidYaw.output_limits = (-MAX_YAW, MAX_YAW)          # PID Range
-        pidRoll = PID(P_ROLL, 0, 0, setpoint=0)             # I = 0.001
-        pidRoll.output_limits = (-MAX_SPEED, MAX_SPEED)     # PID Range
-        print("Configuring P")
+        pid_x = PID(P_X, 0, 0, setpoint=0)
+        pid_y = PID(P_Y, 0, 0, setpoint=0)
+
+    pid_x.output_limits = (-MAX_VEL_RIGHT, MAX_VEL_RIGHT)
+    pid_y.output_limits = (-MAX_VEL_FORWARD, MAX_VEL_FORWARD)
+
+    print("Configured control:", control)
+
 
 def connect_drone(drone_location):
-    drone.connect_drone(drone_location) #'/dev/ttyACM0'
+    return drone.connect_drone(drone_location)
 
-def getMovementYawAngle():
-    return movementYawAngle
 
-def setXdelta(XDelta):
-    global inputValueYaw
-    inputValueYaw = XDelta
+def get_vehicle():
+    return drone.vehicle
 
-def getMovementVelocityXCommand():
-    return movementRollAngle
 
-def setZDelta(ZDelta):
-    global inputValueVelocityX
-    inputValueVelocityX = ZDelta
+def get_mode():
+    return drone.get_mode()
+
 
 def set_system_state(current_state):
     global state
     state = current_state
 
+
 def set_flight_altitude(alt):
     global flight_altitude
     flight_altitude = alt
-# end control functions
 
-#drone functions
+
+def wait_until_armed():
+    print("Waiting for drone to be armed via RC...")
+    while not drone.vehicle.armed:
+        print("Not armed yet, waiting...")
+        time.sleep(1)
+    print("Drone is ARMED")
+
+
+def wait_for_rc_start(channel='6', threshold=1800):
+    print("Waiting for RC mission start on channel", channel)
+    while True:
+        try:
+            val = drone.vehicle.channels.get(channel)
+            if val is not None:
+                val = int(val)
+                print("RC channel {} = {}".format(channel, val))
+                if val >= threshold:
+                    print("RC mission start detected")
+                    return True
+        except Exception as e:
+            print("RC read error:", e)
+
+        time.sleep(0.25)
+
+
+def pilot_took_over():
+    """
+    If the pilot flips to LOITER, autonomy should stop.
+    """
+    try:
+        mode = drone.get_mode()
+        if mode == "LOITER":
+            print("Pilot takeover detected: mode is LOITER")
+            return True
+        return False
+    except Exception as e:
+        print("pilot_took_over check error:", e)
+        return False
+
+
+def get_target_waypoint_from_mission(use_waypoint_mode="first_nav", explicit_index=None):
+    if use_waypoint_mode == "first_nav":
+        wp = drone.get_first_nav_waypoint()
+    elif use_waypoint_mode == "second_nav":
+        wp = drone.get_second_nav_waypoint()
+    elif use_waypoint_mode == "by_index":
+        if explicit_index is None:
+            raise RuntimeError("explicit_index required for by_index mode")
+        wp = drone.get_mission_waypoint_by_index(explicit_index)
+    else:
+        raise RuntimeError("Unknown waypoint mode: {}".format(use_waypoint_mode))
+
+    print("Selected mission waypoint:", wp)
+    return wp
+
+
+def setXdelta(x_delta):
+    global input_err_x
+    input_err_x = x_delta
+
+
+def setYdelta(y_delta):
+    global input_err_y
+    input_err_y = y_delta
+
+
+def get_forward_velocity():
+    return cmd_vel_forward
+
+
+def get_right_velocity():
+    return cmd_vel_right
+
+
 def arm_and_takeoff(max_height):
     drone.arm_and_takeoff(max_height)
 
+
 def land():
     drone.land()
+
+
+def rtl():
+    drone.return_to_launch_location()
+
 
 def print_drone_report():
     print(drone.get_EKF_status())
     print(drone.get_battery_info())
     print(drone.get_version())
-#end drone functions
+    print(drone.get_mode())
+    print(drone.get_location())
 
-def initialize_debug_logs(DEBUG_FILEPATH):
-    global debug_yaw, debug_velocity
-    debug_yaw = open(DEBUG_FILEPATH + "_yaw.txt", "a")
-    debug_yaw.write("P: I: D: Error: command:\n")
 
-    debug_velocity = open(DEBUG_FILEPATH + "_velocity.txt", "a")
-    debug_velocity.write("P: I: D: Error: command:\n")
+def goto_gps_location(lat, lon, alt, groundspeed=1.5, radius_m=1.5, timeout_s=90):
+    drone.goto_location(lat, lon, alt, groundspeed=groundspeed)
 
-def debug_writer_YAW(value):
-    global debug_yaw
-    debug_yaw.write(str(0) + "," + str(0) + "," + str(0) + "," + str(inputValueYaw) + "," + str(value) + "\n")
+    start = time.time()
+    while time.time() - start < timeout_s:
+        if pilot_took_over():
+            return False
 
-def debug_writer_ROLL(value):
-    global debug_velocity
-    debug_velocity.write(str(0) + "," + str(0) + "," + str(0) + "," + str(inputValueYaw) + "," + str(value) + "\n")
+        dist = drone.distance_to_waypoint(lat, lon)
+        print("Distance to waypoint:", round(dist, 2), "m")
+        if dist <= radius_m:
+            print("Reached waypoint")
+            return True
+        time.sleep(1.0)
 
-def control_drone():
-    global movementYawAngle, movementRollAngle
-    if inputValueYaw == 0:
-        drone.send_movement_command_YAW(0)
-    else:
-        movementYawAngle = (pidYaw(inputValueYaw) * -1)
-        drone.send_movement_command_YAW(movementYawAngle)
-        debug_writer_YAW(movementYawAngle)
+    print("goto_gps_location timeout")
+    return False
 
-    if inputValueVelocityX == 0:
-        drone.send_movement_command_XYA(0, 0,flight_altitude)
-    else:
-        movementRollAngle = (pidRoll(inputValueVelocityX) * -1)
-        drone.send_movement_command_XYA(movementRollAngle, 0,flight_altitude)
-        debug_writer_ROLL(movementRollAngle)
 
 def stop_drone():
-    drone.send_movement_command_YAW(0)
-    drone.send_movement_command_XYA(0, 0,flight_altitude)
-    
+    global cmd_vel_forward, cmd_vel_right
+    cmd_vel_forward = 0.0
+    cmd_vel_right = 0.0
+    drone.stop_body_motion(flight_altitude)
+
+
+def hold_position(seconds=1.0):
+    start = time.time()
+    while time.time() - start < seconds:
+        if pilot_took_over():
+            return False
+        stop_drone()
+        time.sleep(0.1)
+    return True
+
+
+def control_drone():
+    """
+    Downward camera centering:
+    x error -> left/right motion
+    y error -> forward/back motion
+
+    You may need to flip signs after first test.
+    """
+    global cmd_vel_forward, cmd_vel_right
+
+    if abs(input_err_x) < 1e-6:
+        cmd_vel_right = 0.0
+    else:
+        cmd_vel_right = -pid_x(input_err_x)
+
+    if abs(input_err_y) < 1e-6:
+        cmd_vel_forward = 0.0
+    else:
+        cmd_vel_forward = -pid_y(input_err_y)
+
+    drone.send_body_velocity_xy(cmd_vel_forward, cmd_vel_right, flight_altitude)
