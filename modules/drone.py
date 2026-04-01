@@ -17,7 +17,7 @@ def connect_drone(connection_string, waitready=True, baudrate=None):
     )
 
     try:
-        vehicle.wait_ready('mode', 'armed', 'attitude', 'location', timeout=120)
+        vehicle.wait_ready('mode', 'armed', 'attitude', 'location', 'commands', timeout=120)
     except Exception as e:
         print("[WARN] wait_ready minimal timed out: {}".format(e))
 
@@ -100,6 +100,7 @@ def set_groundspeed(speed):
 
 def set_flight_mode(f_mode):
     global vehicle
+    print("Setting mode to {}".format(f_mode))
     vehicle.mode = VehicleMode(f_mode)
 
 
@@ -362,3 +363,8 @@ def get_second_nav_waypoint():
         "alt": cmd.z,
         "command": cmd.command
     }
+
+
+def get_next_mission_index():
+    global vehicle
+    return getattr(vehicle.commands, "next", None)

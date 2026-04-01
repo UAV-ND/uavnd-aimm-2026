@@ -9,39 +9,33 @@ sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026')
 sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/modules')
 
 import control
-import lidar
 from target_detector_adapter import TargetDetector
 
 # =========================
 # CONFIG
 # =========================
 UDP_CONNECTION = 'udpin:127.0.0.1:14552'
-LIDAR_PORT = '/dev/ttyTHS1'
-
-TAKEOFF_ALT = 2.0
-MISSION_GROUNDSPEED = 1.5
-
-RC_START_CHANNEL = '6'
-RC_START_THRESHOLD = 1800
 
 MISSION_WAYPOINT_MODE = "first_nav"
-# options:
-# "first_nav"
-# "second_nav"
-# "by_index"
+# "first_nav", "second_nav", "by_index"
 MISSION_WAYPOINT_INDEX = 1
 
-TARGET_WAYPOINT_LAT = None
-TARGET_WAYPOINT_LON = None
-TARGET_WAYPOINT_ALT = None
+# This is the mission item index where AUTO should pause/loiter and hand off.
+# Example:
+#   0 takeoff
+#   1 transit wp
+#   2 loiter over target area  <- handoff
+HANDOFF_MISSION_INDEX = 2
+
+TAKEOFF_ALT = 4.0
 
 CENTER_TOL_X_PX = 25
 CENTER_TOL_Y_PX = 25
 MIN_CONFIDENCE = 0.95
 STABLE_CONFIRM_FRAMES = 10
 
-SEARCH_TIMEOUT_S = 60
 CENTER_TIMEOUT_S = 60
+AUTO_MONITOR_TIMEOUT_S = 300
 
 MA_X_LEN = 5
 MA_Y_LEN = 5
@@ -61,6 +55,7 @@ logging.basicConfig(
 log = logging.getLogger()
 
 STATE = "setup"
+TARGET_WAYPOINT = None
 
 
 def setup():
@@ -71,9 +66,6 @@ def setup():
     control.configure_PID("PID")
     control.set_flight_altitude(TAKEOFF_ALT)
 
-    log.info("Connecting lidar...")
-    lidar.connect_lidar(LIDAR_PORT)
-
     log.info("Starting detector...")
     detector = TargetDetector()
 
@@ -81,95 +73,67 @@ def setup():
 
 
 def load_target_waypoint_from_fc():
-    global TARGET_WAYPOINT_LAT, TARGET_WAYPOINT_LON, TARGET_WAYPOINT_ALT
-
+    global TARGET_WAYPOINT
     log.info("Downloading mission from FC / Mission Planner upload...")
-    wp = control.get_target_waypoint_from_mission(
+    TARGET_WAYPOINT = control.get_target_waypoint_from_mission(
         use_waypoint_mode=MISSION_WAYPOINT_MODE,
         explicit_index=MISSION_WAYPOINT_INDEX
     )
-
-    TARGET_WAYPOINT_LAT = wp["lat"]
-    TARGET_WAYPOINT_LON = wp["lon"]
-    TARGET_WAYPOINT_ALT = TAKEOFF_ALT if wp["alt"] is None or wp["alt"] <= 0 else wp["alt"]
-
-    log.info(
-        "Loaded target waypoint from mission: seq=%s lat=%s lon=%s alt=%s",
-        wp["seq"], TARGET_WAYPOINT_LAT, TARGET_WAYPOINT_LON, TARGET_WAYPOINT_ALT
-    )
+    log.info("Target waypoint loaded: %s", TARGET_WAYPOINT)
 
 
-def wait_for_arm_and_start():
+def wait_for_auto_start():
     log.info("Waiting for RC arm...")
     control.wait_until_armed()
 
-    time.sleep(2.0)
-
-    log.info("Reading target waypoint from uploaded mission")
+    log.info("Reading mission upload from Mission Planner...")
     load_target_waypoint_from_fc()
 
-    log.info("Waiting for RC start switch on channel %s...", RC_START_CHANNEL)
-    control.wait_for_rc_start(channel=RC_START_CHANNEL, threshold=RC_START_THRESHOLD)
+    log.info("Waiting for pilot to put vehicle in AUTO and launch...")
+    control.wait_for_auto_mode()
 
 
-def takeoff():
-    if control.pilot_took_over():
-        return "manual_override"
-
-    log.info("Taking off to %.2f m", TAKEOFF_ALT)
-    control.arm_and_takeoff(TAKEOFF_ALT)
-    time.sleep(3.0)
-    return "goto_target"
-
-
-def goto_target():
-    if control.pilot_took_over():
-        return "manual_override"
-
-    log.info("Going to target area waypoint")
-    reached = control.goto_gps_location(
-        TARGET_WAYPOINT_LAT,
-        TARGET_WAYPOINT_LON,
-        TARGET_WAYPOINT_ALT,
-        groundspeed=MISSION_GROUNDSPEED,
-        radius_m=1.5,
-        timeout_s=120
-    )
-
-    if control.pilot_took_over():
-        return "manual_override"
-
-    if not reached:
-        log.info("Goto interrupted or timed out, switching to RTL")
-        return "rtl"
-
-    control.hold_position(2.0)
-
-    if control.pilot_took_over():
-        return "manual_override"
-
-    return "search_target"
-
-
-def search_target(detector):
-    log.info("Searching for target...")
+def wait_for_handoff_in_auto():
+    log.info("Monitoring AUTO mission for handoff waypoint index %s", HANDOFF_MISSION_INDEX)
     start = time.time()
 
-    while time.time() - start < SEARCH_TIMEOUT_S:
+    while time.time() - start < AUTO_MONITOR_TIMEOUT_S:
         if control.pilot_took_over():
             return "manual_override"
 
-        det = detector.get_target_info()
-        if det is not None and det["has_target"]:
-            log.info("Target detected: conf=%.3f stable_counter=%d",
-                     det["confidence"], det["stable_counter"])
-            return "center_target"
+        mode = control.get_mode()
+        next_idx = control.get_next_mission_index()
 
-        control.stop_drone()
-        time.sleep(0.05)
+        log.info("AUTO monitor: mode=%s next_mission_index=%s", mode, next_idx)
 
-    log.info("Search timeout")
+        if mode != "AUTO":
+            log.info("Vehicle left AUTO before handoff")
+            return "manual_override"
+
+        # The FC increments commands.next as it advances.
+        # At or past the handoff index means we are at/through the loiter target area.
+        if next_idx is not None and int(next_idx) >= int(HANDOFF_MISSION_INDEX):
+            log.info("Reached handoff waypoint area")
+            return "guided_handoff"
+
+        time.sleep(1.0)
+
+    log.info("AUTO monitor timeout")
     return "rtl"
+
+
+def guided_handoff():
+    if control.pilot_took_over():
+        return "manual_override"
+
+    log.info("Switching from AUTO to GUIDED for vision phase")
+    ok = control.switch_to_guided()
+    if not ok:
+        log.info("Failed to switch to GUIDED or pilot took over")
+        return "manual_override"
+
+    control.hold_position(1.5)
+    return "center_target"
 
 
 def center_target(detector):
@@ -188,9 +152,10 @@ def center_target(detector):
         det = detector.get_target_info()
 
         if det is None or not det["has_target"]:
-            log.info("Lost target, returning to search")
+            log.info("No target currently visible; holding")
             control.stop_drone()
-            return "search_target"
+            time.sleep(0.05)
+            continue
 
         x_error_px = det["x_error_px"]
         y_error_px = det["y_error_px"]
@@ -210,7 +175,6 @@ def center_target(detector):
         centered_x = abs(x_err_ma) <= CENTER_TOL_X_PX
         centered_y = abs(y_err_ma) <= CENTER_TOL_Y_PX
         good_conf = conf >= MIN_CONFIDENCE
-
         good_to_drop = centered_x and centered_y and good_conf and det_stable
 
         if good_to_drop:
@@ -271,20 +235,17 @@ def main():
 
     try:
         detector = setup()
-        wait_for_arm_and_start()
-        STATE = "takeoff"
+        wait_for_auto_start()
+        STATE = "wait_for_handoff"
 
         while STATE != "done":
             log.info("STATE = %s | MODE = %s", STATE, control.get_mode())
 
-            if STATE == "takeoff":
-                STATE = takeoff()
+            if STATE == "wait_for_handoff":
+                STATE = wait_for_handoff_in_auto()
 
-            elif STATE == "goto_target":
-                STATE = goto_target()
-
-            elif STATE == "search_target":
-                STATE = search_target(detector)
+            elif STATE == "guided_handoff":
+                STATE = guided_handoff()
 
             elif STATE == "center_target":
                 STATE = center_target(detector)

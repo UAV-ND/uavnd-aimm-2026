@@ -54,6 +54,10 @@ def get_mode():
     return drone.get_mode()
 
 
+def get_next_mission_index():
+    return drone.get_next_mission_index()
+
+
 def set_system_state(current_state):
     global state
     state = current_state
@@ -72,27 +76,18 @@ def wait_until_armed():
     print("Drone is ARMED")
 
 
-def wait_for_rc_start(channel='6', threshold=1800):
-    print("Waiting for RC mission start on channel", channel)
+def wait_for_auto_mode():
+    print("Waiting for pilot to switch to AUTO...")
     while True:
-        try:
-            val = drone.vehicle.channels.get(channel)
-            if val is not None:
-                val = int(val)
-                print("RC channel {} = {}".format(channel, val))
-                if val >= threshold:
-                    print("RC mission start detected")
-                    return True
-        except Exception as e:
-            print("RC read error:", e)
-
-        time.sleep(0.25)
+        mode = drone.get_mode()
+        print("Current mode:", mode)
+        if mode == "AUTO":
+            print("AUTO mode detected")
+            return True
+        time.sleep(0.5)
 
 
 def pilot_took_over():
-    """
-    If the pilot flips to LOITER, autonomy should stop.
-    """
     try:
         mode = drone.get_mode()
         if mode == "LOITER":
@@ -102,6 +97,21 @@ def pilot_took_over():
     except Exception as e:
         print("pilot_took_over check error:", e)
         return False
+
+
+def switch_to_guided():
+    if pilot_took_over():
+        return False
+    drone.set_flight_mode("GUIDED")
+    time.sleep(1.0)
+    return drone.get_mode() == "GUIDED"
+
+
+def rtl():
+    if pilot_took_over():
+        return False
+    drone.return_to_launch_location()
+    return True
 
 
 def get_target_waypoint_from_mission(use_waypoint_mode="first_nav", explicit_index=None):
@@ -138,45 +148,6 @@ def get_right_velocity():
     return cmd_vel_right
 
 
-def arm_and_takeoff(max_height):
-    drone.arm_and_takeoff(max_height)
-
-
-def land():
-    drone.land()
-
-
-def rtl():
-    drone.return_to_launch_location()
-
-
-def print_drone_report():
-    print(drone.get_EKF_status())
-    print(drone.get_battery_info())
-    print(drone.get_version())
-    print(drone.get_mode())
-    print(drone.get_location())
-
-
-def goto_gps_location(lat, lon, alt, groundspeed=1.5, radius_m=1.5, timeout_s=90):
-    drone.goto_location(lat, lon, alt, groundspeed=groundspeed)
-
-    start = time.time()
-    while time.time() - start < timeout_s:
-        if pilot_took_over():
-            return False
-
-        dist = drone.distance_to_waypoint(lat, lon)
-        print("Distance to waypoint:", round(dist, 2), "m")
-        if dist <= radius_m:
-            print("Reached waypoint")
-            return True
-        time.sleep(1.0)
-
-    print("goto_gps_location timeout")
-    return False
-
-
 def stop_drone():
     global cmd_vel_forward, cmd_vel_right
     cmd_vel_forward = 0.0
@@ -195,13 +166,6 @@ def hold_position(seconds=1.0):
 
 
 def control_drone():
-    """
-    Downward camera centering:
-    x error -> left/right motion
-    y error -> forward/back motion
-
-    You may need to flip signs after first test.
-    """
     global cmd_vel_forward, cmd_vel_right
 
     if abs(input_err_x) < 1e-6:
