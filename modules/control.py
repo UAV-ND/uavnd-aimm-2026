@@ -68,6 +68,11 @@ def set_flight_altitude(alt):
     flight_altitude = alt
 
 
+def get_flight_altitude():
+    global flight_altitude
+    return flight_altitude
+
+
 def wait_until_armed():
     print("Waiting for drone to be armed via RC...")
     while not drone.vehicle.armed:
@@ -107,27 +112,28 @@ def switch_to_guided():
     return drone.get_mode() == "GUIDED"
 
 
-def rtl():
-    if pilot_took_over():
-        return False
-    drone.return_to_launch_location()
-    return True
-
-
-def get_target_waypoint_from_mission(use_waypoint_mode="first_nav", explicit_index=None):
-    if use_waypoint_mode == "first_nav":
-        wp = drone.get_first_nav_waypoint()
-    elif use_waypoint_mode == "second_nav":
-        wp = drone.get_second_nav_waypoint()
-    elif use_waypoint_mode == "by_index":
-        if explicit_index is None:
-            raise RuntimeError("explicit_index required for by_index mode")
-        wp = drone.get_mission_waypoint_by_index(explicit_index)
-    else:
-        raise RuntimeError("Unknown waypoint mode: {}".format(use_waypoint_mode))
-
+def get_target_waypoint_from_mission(explicit_index=None):
+    if explicit_index is None:
+        raise RuntimeError("explicit_index required")
+    wp = drone.get_mission_waypoint_by_index(explicit_index)
     print("Selected mission waypoint:", wp)
     return wp
+
+
+def goto_gps_location(lat, lon, alt, groundspeed=1.5, radius_m=2.0, timeout_s=90):
+    drone.goto_location(lat, lon, alt, groundspeed=groundspeed)
+
+    start = time.time()
+    while time.time() - start < timeout_s:
+        if pilot_took_over():
+            return False
+        dist = drone.distance_to_waypoint(lat, lon)
+        print("Distance to waypoint:", round(dist, 2), "m")
+        if dist <= radius_m:
+            return True
+        time.sleep(1.0)
+
+    return False
 
 
 def setXdelta(x_delta):
@@ -166,6 +172,13 @@ def hold_position(seconds=1.0):
 
 
 def control_drone():
+    """
+    Downward camera centering:
+    x error -> left/right motion
+    y error -> forward/back motion
+
+    Flip signs here if motion is reversed in testing.
+    """
     global cmd_vel_forward, cmd_vel_right
 
     if abs(input_err_x) < 1e-6:
@@ -179,3 +192,10 @@ def control_drone():
         cmd_vel_forward = -pid_y(input_err_y)
 
     drone.send_body_velocity_xy(cmd_vel_forward, cmd_vel_right, flight_altitude)
+
+
+def final_land():
+    if pilot_took_over():
+        return False
+    drone.land()
+    return True

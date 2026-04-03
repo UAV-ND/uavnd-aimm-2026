@@ -328,43 +328,6 @@ def get_mission_waypoint_by_index(index):
     }
 
 
-def get_first_nav_waypoint():
-    cmds = list_mission_commands()
-
-    for cmd in cmds:
-        if cmd.command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
-            return {
-                "seq": cmd.seq,
-                "lat": cmd.x,
-                "lon": cmd.y,
-                "alt": cmd.z,
-                "command": cmd.command
-            }
-
-    raise RuntimeError("No NAV_WAYPOINT found in uploaded mission")
-
-
-def get_second_nav_waypoint():
-    cmds = list_mission_commands()
-    navs = []
-
-    for cmd in cmds:
-        if cmd.command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
-            navs.append(cmd)
-
-    if len(navs) < 2:
-        raise RuntimeError("Mission has fewer than 2 NAV_WAYPOINT items")
-
-    cmd = navs[1]
-    return {
-        "seq": cmd.seq,
-        "lat": cmd.x,
-        "lon": cmd.y,
-        "alt": cmd.z,
-        "command": cmd.command
-    }
-
-
 def get_next_mission_index():
     global vehicle
     return getattr(vehicle.commands, "next", None)

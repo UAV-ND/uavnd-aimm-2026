@@ -9,38 +9,68 @@ sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026')
 sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/modules')
 
 import control
-from target_detector_adapter import TargetDetector
+import lidar
+import boat_radio
+from detector_adapter import GenericDetector
 
 # =========================
 # CONFIG
 # =========================
 UDP_CONNECTION = 'udpin:127.0.0.1:14552'
+LIDAR_PORT = '/dev/ttyTHS1'
+BOAT_RADIO_PORT = '/dev/ttyUSB0'
+BOAT_RADIO_BAUD = 57600
 
-MISSION_WAYPOINT_MODE = "first_nav"
-# "first_nav", "second_nav", "by_index"
-MISSION_WAYPOINT_INDEX = 1
-
-# This is the mission item index where AUTO should pause/loiter and hand off.
+# Mission Planner AUTO mission structure
 # Example:
-#   0 takeoff
-#   1 transit wp
-#   2 loiter over target area  <- handoff
+# 0 takeoff
+# 1 transit
+# 2 loiter over payload area <-- handoff point
+PAYLOAD_TARGET_MISSION_INDEX = 2
 HANDOFF_MISSION_INDEX = 2
 
-TAKEOFF_ALT = 4.0
+# Engines
+PAYLOAD_ENGINE_PATH = 'engine.engine'
+LANDING_PAD_ENGINE_PATH = 'landing_pad.engine'
 
-CENTER_TOL_X_PX = 25
-CENTER_TOL_Y_PX = 25
-MIN_CONFIDENCE = 0.95
-STABLE_CONFIRM_FRAMES = 10
+# Flight altitudes
+GUIDED_HOLD_ALT = 4.0
+BOAT_STAGE_ALT = 6.0
+BOAT_DESCENT_START_ALT = 5.0
+BOAT_FINAL_LAND_ALT = 1.0
 
-CENTER_TIMEOUT_S = 60
-AUTO_MONITOR_TIMEOUT_S = 300
+MISSION_GROUNDSPEED = 1.5
+BOAT_STAGE_RADIUS_M = 3.0
 
+# Payload target centering
+PAYLOAD_CENTER_TOL_X_PX = 25
+PAYLOAD_CENTER_TOL_Y_PX = 25
+PAYLOAD_MIN_CONFIDENCE = 0.95
+PAYLOAD_STABLE_CONFIRM_FRAMES = 10
+PAYLOAD_CENTER_TIMEOUT_S = 60
+
+# Boat search / align
+BOAT_SEARCH_TIMEOUT_S = 90
+BOAT_ALIGN_CENTER_TOL_X_PX = 20
+BOAT_ALIGN_CENTER_TOL_Y_PX = 20
+BOAT_ALIGN_MIN_CONFIDENCE = 0.90
+BOAT_ALIGN_STABLE_CONFIRM_FRAMES = 10
+BOAT_ALIGN_TIMEOUT_S = 90
+
+# Boat descent
+DESCENT_STEP_M = 0.25
+DESCENT_UPDATE_PERIOD_S = 1.0
+DESCENT_CENTER_TOL_X_PX = 20
+DESCENT_CENTER_TOL_Y_PX = 20
+DESCENT_MIN_CONFIDENCE = 0.90
+DESCENT_SWITCH_TO_LAND_ALT_M = 1.2
+DESCENT_TIMEOUT_S = 180
+
+# Moving average windows
 MA_X_LEN = 5
 MA_Y_LEN = 5
 
-RTL_WAIT_BEFORE_EXIT_S = 10
+AUTO_MONITOR_TIMEOUT_S = 300
 
 log_path = '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/test/mission_mvp.log'
 logging.basicConfig(
@@ -55,7 +85,8 @@ logging.basicConfig(
 log = logging.getLogger()
 
 STATE = "setup"
-TARGET_WAYPOINT = None
+PAYLOAD_TARGET_WAYPOINT = None
+LATEST_BOAT_GPS = None
 
 
 def setup():
@@ -64,37 +95,52 @@ def setup():
     log.info("Connecting to drone...")
     control.connect_drone(UDP_CONNECTION)
     control.configure_PID("PID")
-    control.set_flight_altitude(TAKEOFF_ALT)
+    control.set_flight_altitude(GUIDED_HOLD_ALT)
 
-    log.info("Starting detector...")
-    detector = TargetDetector()
+    log.info("Connecting lidar...")
+    lidar.connect_lidar(LIDAR_PORT)
 
-    return detector
+    log.info("Connecting boat radio...")
+    boat_radio.connect_boat_radio(BOAT_RADIO_PORT, baudrate=BOAT_RADIO_BAUD, timeout=1.0)
 
-
-def load_target_waypoint_from_fc():
-    global TARGET_WAYPOINT
-    log.info("Downloading mission from FC / Mission Planner upload...")
-    TARGET_WAYPOINT = control.get_target_waypoint_from_mission(
-        use_waypoint_mode=MISSION_WAYPOINT_MODE,
-        explicit_index=MISSION_WAYPOINT_INDEX
+    log.info("Starting payload detector...")
+    payload_detector = GenericDetector(
+        engine_path=PAYLOAD_ENGINE_PATH,
+        enable_payload_gpio=True
     )
-    log.info("Target waypoint loaded: %s", TARGET_WAYPOINT)
+
+    log.info("Starting landing pad detector...")
+    landing_pad_detector = GenericDetector(
+        engine_path=LANDING_PAD_ENGINE_PATH,
+        trigger_conf=0.90,
+        stable_dist_px=80,
+        area_ratio_min=0.45,
+        area_ratio_max=2.20,
+        enable_payload_gpio=False
+    )
+
+    return payload_detector, landing_pad_detector
+
+
+def load_payload_waypoint_from_fc():
+    global PAYLOAD_TARGET_WAYPOINT
+    log.info("Downloading mission from FC / Mission Planner upload...")
+    PAYLOAD_TARGET_WAYPOINT = control.get_target_waypoint_from_mission(
+        explicit_index=PAYLOAD_TARGET_MISSION_INDEX
+    )
+    log.info("Payload target waypoint loaded: %s", PAYLOAD_TARGET_WAYPOINT)
 
 
 def wait_for_auto_start():
-    log.info("Waiting for RC arm...")
+    log.info("wait_for_auto_start")
     control.wait_until_armed()
-
-    log.info("Reading mission upload from Mission Planner...")
-    load_target_waypoint_from_fc()
-
-    log.info("Waiting for pilot to put vehicle in AUTO and launch...")
+    load_payload_waypoint_from_fc()
     control.wait_for_auto_mode()
+    return "wait_for_handoff"
 
 
-def wait_for_handoff_in_auto():
-    log.info("Monitoring AUTO mission for handoff waypoint index %s", HANDOFF_MISSION_INDEX)
+def wait_for_handoff():
+    log.info("wait_for_handoff | monitoring AUTO for handoff index %s", HANDOFF_MISSION_INDEX)
     start = time.time()
 
     while time.time() - start < AUTO_MONITOR_TIMEOUT_S:
@@ -110,8 +156,6 @@ def wait_for_handoff_in_auto():
             log.info("Vehicle left AUTO before handoff")
             return "manual_override"
 
-        # The FC increments commands.next as it advances.
-        # At or past the handoff index means we are at/through the loiter target area.
         if next_idx is not None and int(next_idx) >= int(HANDOFF_MISSION_INDEX):
             log.info("Reached handoff waypoint area")
             return "guided_handoff"
@@ -119,40 +163,36 @@ def wait_for_handoff_in_auto():
         time.sleep(1.0)
 
     log.info("AUTO monitor timeout")
-    return "rtl"
+    return "manual_override"
 
 
 def guided_handoff():
+    log.info("guided_handoff")
     if control.pilot_took_over():
         return "manual_override"
 
-    log.info("Switching from AUTO to GUIDED for vision phase")
     ok = control.switch_to_guided()
     if not ok:
-        log.info("Failed to switch to GUIDED or pilot took over")
         return "manual_override"
 
+    control.set_flight_altitude(GUIDED_HOLD_ALT)
     control.hold_position(1.5)
-    return "center_target"
+    return "center_payload_target"
 
 
-def center_target(detector):
-    log.info("Centering over target...")
-
+def _center_with_detector(detector, center_tol_x, center_tol_y, min_conf, stable_frames, timeout_s, state_name):
     ma_x = deque(maxlen=MA_X_LEN)
     ma_y = deque(maxlen=MA_Y_LEN)
-
-    stable_drop_counter = 0
+    stable_counter = 0
     start = time.time()
 
-    while time.time() - start < CENTER_TIMEOUT_S:
+    while time.time() - start < timeout_s:
         if control.pilot_took_over():
-            return "manual_override"
+            return "manual_override", None
 
         det = detector.get_target_info()
 
         if det is None or not det["has_target"]:
-            log.info("No target currently visible; holding")
             control.stop_drone()
             time.sleep(0.05)
             continue
@@ -172,56 +212,231 @@ def center_target(detector):
         control.setYdelta(y_err_ma)
         control.control_drone()
 
-        centered_x = abs(x_err_ma) <= CENTER_TOL_X_PX
-        centered_y = abs(y_err_ma) <= CENTER_TOL_Y_PX
-        good_conf = conf >= MIN_CONFIDENCE
-        good_to_drop = centered_x and centered_y and good_conf and det_stable
+        centered_x = abs(x_err_ma) <= center_tol_x
+        centered_y = abs(y_err_ma) <= center_tol_y
+        good_conf = conf >= min_conf
+        good = centered_x and centered_y and good_conf and det_stable
 
-        if good_to_drop:
-            stable_drop_counter += 1
+        if good:
+            stable_counter += 1
         else:
-            stable_drop_counter = max(0, stable_drop_counter - 1)
+            stable_counter = max(0, stable_counter - 1)
 
         log.info(
-            "center: conf=%.3f x_err=%.2f y_err=%.2f centered_x=%s centered_y=%s stable=%s drop_counter=%d",
-            conf, x_err_ma, y_err_ma,
-            centered_x, centered_y, det_stable, stable_drop_counter
+            "%s: conf=%.3f x_err=%.2f y_err=%.2f centered_x=%s centered_y=%s stable=%s stable_counter=%d",
+            state_name, conf, x_err_ma, y_err_ma,
+            centered_x, centered_y, det_stable, stable_counter
         )
 
-        if stable_drop_counter >= STABLE_CONFIRM_FRAMES:
+        if stable_counter >= stable_frames:
             control.stop_drone()
-            return "drop_payload"
+            return "ok", det
 
         time.sleep(0.05)
 
-    log.info("Center timeout")
     control.stop_drone()
-    return "rtl"
+    return "timeout", None
 
 
-def drop_payload(detector):
+def center_payload_target(payload_detector):
+    log.info("center_payload_target")
+    result, _ = _center_with_detector(
+        detector=payload_detector,
+        center_tol_x=PAYLOAD_CENTER_TOL_X_PX,
+        center_tol_y=PAYLOAD_CENTER_TOL_Y_PX,
+        min_conf=PAYLOAD_MIN_CONFIDENCE,
+        stable_frames=PAYLOAD_STABLE_CONFIRM_FRAMES,
+        timeout_s=PAYLOAD_CENTER_TIMEOUT_S,
+        state_name="payload_center"
+    )
+
+    if result == "manual_override":
+        return "manual_override"
+    if result == "ok":
+        return "drop_payload"
+    return "manual_override"
+
+
+def drop_payload(payload_detector):
+    log.info("drop_payload")
     if control.pilot_took_over():
         return "manual_override"
 
-    log.info("Triggering payload drop")
-    detector.trigger_payload()
+    payload_detector.trigger_payload()
     time.sleep(2.0)
-    return "rtl"
+    return "wait_for_boat_gps"
 
 
-def rtl():
+def wait_for_boat_gps():
+    global LATEST_BOAT_GPS
+    log.info("wait_for_boat_gps")
+    start = time.time()
+
+    while time.time() - start < 30:
+        if control.pilot_took_over():
+            return "manual_override"
+
+        msg = boat_radio.read_boat_gps()
+        if msg is not None:
+            LATEST_BOAT_GPS = msg
+            log.info("Boat GPS received: %s", LATEST_BOAT_GPS)
+            return "goto_boat_gps"
+
+        time.sleep(0.1)
+
+    log.info("No boat GPS received")
+    return "manual_override"
+
+
+def goto_boat_gps():
+    global LATEST_BOAT_GPS
+    log.info("goto_boat_gps")
+
     if control.pilot_took_over():
         return "manual_override"
 
-    log.info("Switching to RTL")
+    if LATEST_BOAT_GPS is None:
+        return "wait_for_boat_gps"
+
+    control.set_flight_altitude(BOAT_STAGE_ALT)
+
+    ok = control.goto_gps_location(
+        lat=LATEST_BOAT_GPS["lat"],
+        lon=LATEST_BOAT_GPS["lon"],
+        alt=BOAT_STAGE_ALT,
+        groundspeed=MISSION_GROUNDSPEED,
+        radius_m=BOAT_STAGE_RADIUS_M,
+        timeout_s=120
+    )
+
+    if not ok:
+        return "manual_override"
+
+    control.hold_position(2.0)
+    return "search_boat"
+
+
+def search_boat(landing_pad_detector):
+    log.info("search_boat")
+    start = time.time()
+
+    while time.time() - start < BOAT_SEARCH_TIMEOUT_S:
+        if control.pilot_took_over():
+            return "manual_override"
+
+        det = landing_pad_detector.get_target_info()
+        if det is not None and det["has_target"]:
+            log.info("Landing pad detected: conf=%.3f stable_counter=%d",
+                     det["confidence"], det["stable_counter"])
+            return "align_over_boat"
+
+        control.stop_drone()
+        time.sleep(0.05)
+
+    log.info("Boat search timeout")
+    return "manual_override"
+
+
+def align_over_boat(landing_pad_detector):
+    log.info("align_over_boat")
+    control.set_flight_altitude(BOAT_DESCENT_START_ALT)
+
+    result, _ = _center_with_detector(
+        detector=landing_pad_detector,
+        center_tol_x=BOAT_ALIGN_CENTER_TOL_X_PX,
+        center_tol_y=BOAT_ALIGN_CENTER_TOL_Y_PX,
+        min_conf=BOAT_ALIGN_MIN_CONFIDENCE,
+        stable_frames=BOAT_ALIGN_STABLE_CONFIRM_FRAMES,
+        timeout_s=BOAT_ALIGN_TIMEOUT_S,
+        state_name="boat_align"
+    )
+
+    if result == "manual_override":
+        return "manual_override"
+    if result == "ok":
+        return "descend_on_boat"
+    return "manual_override"
+
+
+def descend_on_boat(landing_pad_detector):
+    log.info("descend_on_boat")
+    start = time.time()
+    last_descent_time = 0.0
+
+    ma_x = deque(maxlen=MA_X_LEN)
+    ma_y = deque(maxlen=MA_Y_LEN)
+
+    while time.time() - start < DESCENT_TIMEOUT_S:
+        if control.pilot_took_over():
+            return "manual_override"
+
+        det = landing_pad_detector.get_target_info()
+        if det is None or not det["has_target"]:
+            log.info("Lost landing pad during descent, holding")
+            control.stop_drone()
+            time.sleep(0.1)
+            continue
+
+        x_error_px = det["x_error_px"]
+        y_error_px = det["y_error_px"]
+        conf = det["confidence"]
+        det_stable = det["stable"]
+
+        lidar_dist, _ = lidar.read_lidar_distance()
+
+        ma_x.append(x_error_px)
+        ma_y.append(y_error_px)
+
+        x_err_ma = sum(ma_x) / len(ma_x)
+        y_err_ma = sum(ma_y) / len(ma_y)
+
+        control.setXdelta(x_err_ma)
+        control.setYdelta(y_err_ma)
+        control.control_drone()
+
+        centered_x = abs(x_err_ma) <= DESCENT_CENTER_TOL_X_PX
+        centered_y = abs(y_err_ma) <= DESCENT_CENTER_TOL_Y_PX
+        good_conf = conf >= DESCENT_MIN_CONFIDENCE
+        good = centered_x and centered_y and good_conf and det_stable
+
+        log.info(
+            "boat_descent: conf=%.3f x_err=%.2f y_err=%.2f lidar=%.2f centered_x=%s centered_y=%s stable=%s cmd_alt=%.2f",
+            conf, x_err_ma, y_err_ma, lidar_dist,
+            centered_x, centered_y, det_stable, control.get_flight_altitude()
+        )
+
+        if good and (time.time() - last_descent_time) >= DESCENT_UPDATE_PERIOD_S:
+            new_alt = max(BOAT_FINAL_LAND_ALT, control.get_flight_altitude() - DESCENT_STEP_M)
+            control.set_flight_altitude(new_alt)
+            last_descent_time = time.time()
+            log.info("Descent step -> new commanded altitude %.2f", new_alt)
+
+        if lidar_dist <= DESCENT_SWITCH_TO_LAND_ALT_M and good:
+            control.stop_drone()
+            return "final_land"
+
+        time.sleep(0.05)
+
+    log.info("Descent timeout")
     control.stop_drone()
-    control.rtl()
-    time.sleep(RTL_WAIT_BEFORE_EXIT_S)
+    return "manual_override"
+
+
+def final_land():
+    log.info("final_land")
+    if control.pilot_took_over():
+        return "manual_override"
+
+    ok = control.final_land()
+    if not ok:
+        return "manual_override"
+
+    time.sleep(10.0)
     return "done"
 
 
 def manual_override():
-    log.info("Manual override engaged by pilot via LOITER. Stopping autonomy.")
+    log.info("manual_override")
     try:
         control.stop_drone()
     except Exception:
@@ -231,30 +446,48 @@ def manual_override():
 
 def main():
     global STATE
-    detector = None
+    payload_detector = None
+    landing_pad_detector = None
 
     try:
-        detector = setup()
-        wait_for_auto_start()
-        STATE = "wait_for_handoff"
+        payload_detector, landing_pad_detector = setup()
+        STATE = "wait_for_auto_start"
 
         while STATE != "done":
             log.info("STATE = %s | MODE = %s", STATE, control.get_mode())
 
-            if STATE == "wait_for_handoff":
-                STATE = wait_for_handoff_in_auto()
+            if STATE == "wait_for_auto_start":
+                STATE = wait_for_auto_start()
+
+            elif STATE == "wait_for_handoff":
+                STATE = wait_for_handoff()
 
             elif STATE == "guided_handoff":
                 STATE = guided_handoff()
 
-            elif STATE == "center_target":
-                STATE = center_target(detector)
+            elif STATE == "center_payload_target":
+                STATE = center_payload_target(payload_detector)
 
             elif STATE == "drop_payload":
-                STATE = drop_payload(detector)
+                STATE = drop_payload(payload_detector)
 
-            elif STATE == "rtl":
-                STATE = rtl()
+            elif STATE == "wait_for_boat_gps":
+                STATE = wait_for_boat_gps()
+
+            elif STATE == "goto_boat_gps":
+                STATE = goto_boat_gps()
+
+            elif STATE == "search_boat":
+                STATE = search_boat(landing_pad_detector)
+
+            elif STATE == "align_over_boat":
+                STATE = align_over_boat(landing_pad_detector)
+
+            elif STATE == "descend_on_boat":
+                STATE = descend_on_boat(landing_pad_detector)
+
+            elif STATE == "final_land":
+                STATE = final_land()
 
             elif STATE == "manual_override":
                 STATE = manual_override()
@@ -275,13 +508,32 @@ def main():
         log.error(traceback.format_exc())
         try:
             control.stop_drone()
-            control.rtl()
         except Exception:
             pass
 
     finally:
-        if detector is not None:
-            detector.close()
+        try:
+            if payload_detector is not None:
+                payload_detector.close()
+        except Exception:
+            pass
+
+        try:
+            if landing_pad_detector is not None:
+                landing_pad_detector.close()
+        except Exception:
+            pass
+
+        try:
+            boat_radio.disconnect_boat_radio()
+        except Exception:
+            pass
+
+        try:
+            lidar.disconnect_lidar()
+        except Exception:
+            pass
+
         log.info("=== mission_mvp.py finished ===")
 
 
