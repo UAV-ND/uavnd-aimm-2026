@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
+# detector_adapter.py
+#
+# Unified detector for a single TensorRT model with three classes:
+#   "black_buoy", "target", "boat"
+#
+# Each mission stage constructs GenericDetector with the class it cares about.
+# Detections that don't match target_class are ignored entirely.
+
 import time
 import cv2
+import threading
 import Jetson.GPIO as GPIO
 
-from cv_2 import TensorRTInfer, preprocess, postprocess, gstreamer_pipeline
+from minimal_cv import TensorRTInfer, preprocess, postprocess, gstreamer_pipeline
+
+VALID_CLASSES = ["black_buoy", "target", "boat"]
 
 PAYLOAD_PIN = 16
 PAYLOAD_PULSE_S = 0.5
@@ -13,6 +24,7 @@ class GenericDetector:
     def __init__(
         self,
         engine_path,
+        target_class,                  # "black_buoy" | "target" | "boat"
         smooth_alpha=0.12,
         trigger_conf=0.97,
         stable_dist_px=100,
@@ -20,7 +32,14 @@ class GenericDetector:
         area_ratio_max=1.80,
         enable_payload_gpio=False
     ):
-        self.engine_path = engine_path
+        if target_class not in VALID_CLASSES:
+            raise ValueError(
+                "target_class '{}' is not valid. Choose from: {}".format(
+                    target_class, VALID_CLASSES
+                )
+            )
+
+        self.target_class = target_class
         self.smooth_alpha = smooth_alpha
         self.trigger_conf = trigger_conf
         self.stable_dist_px = stable_dist_px
@@ -28,12 +47,18 @@ class GenericDetector:
         self.area_ratio_max = area_ratio_max
         self.enable_payload_gpio = enable_payload_gpio
 
-        print("Loading TensorRT engine:", self.engine_path)
-        self.trt_infer = TensorRTInfer(self.engine_path)
+        # Class index is the position in VALID_CLASSES.
+        # This must match the order your model was trained with.
+        self.target_class_id = VALID_CLASSES.index(target_class)
+
+        print("[GenericDetector] Loading TensorRT engine: {}".format(engine_path))
+        print("[GenericDetector] Filtering for class: '{}' (id={})".format(
+            target_class, self.target_class_id
+        ))
+        self.trt_infer = TensorRTInfer(engine_path)
 
         pipeline = gstreamer_pipeline(flip_method=0)
-        print("Using pipeline:")
-        print(pipeline)
+        print("[GenericDetector] Pipeline: {}".format(pipeline))
 
         self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if not self.cap.isOpened():
@@ -51,13 +76,30 @@ class GenericDetector:
             GPIO.output(PAYLOAD_PIN, GPIO.LOW)
 
     def get_target_info(self):
+        """
+        Returns a dict:
+          has_target      bool
+          confidence      float
+          x_error_px      float  (positive = target is RIGHT of center)
+          y_error_px      float  (positive = target is BELOW center)
+          stable          bool   (True once stable_counter >= 4)
+          stable_counter  int
+          box             [x1, y1, x2, y2] or absent if no target
+        """
         ret, frame = self.cap.read()
         if not ret:
             return None
 
         inp, r, dw, dh = preprocess(frame)
         output = self.trt_infer.infer(inp)
-        detections = postprocess(output, frame, r, dw, dh)
+        all_detections = postprocess(output, frame, r, dw, dh)
+
+        # Filter to only the class this detector instance cares about
+        detections = [
+            (box, score, class_id)
+            for box, score, class_id in all_detections
+            if class_id == self.target_class_id
+        ]
 
         frame_h, frame_w = frame.shape[:2]
         image_cx = frame_w / 2.0
@@ -69,7 +111,6 @@ class GenericDetector:
             self.stable_counter = 0
             self.smooth_cx = None
             self.smooth_cy = None
-
             return {
                 "has_target": False,
                 "confidence": 0.0,
@@ -79,6 +120,7 @@ class GenericDetector:
                 "stable_counter": 0
             }
 
+        # Pick highest confidence detection for this class
         best_det = max(detections, key=lambda x: x[1])
         box, score, class_id = best_det
         x1, y1, x2, y2 = box
@@ -95,13 +137,15 @@ class GenericDetector:
             self.smooth_cy = self.smooth_alpha * cy + (1.0 - self.smooth_alpha) * self.smooth_cy
 
         if self.prev_center is not None and self.prev_area is not None:
-            dist = ((cx - self.prev_center[0]) ** 2 + (cy - self.prev_center[1]) ** 2) ** 0.5
+            dist = (
+                (cx - self.prev_center[0]) ** 2 + (cy - self.prev_center[1]) ** 2
+            ) ** 0.5
             area_ratio = area / max(self.prev_area, 1.0)
 
             if (
-                score >= self.trigger_conf and
-                dist < self.stable_dist_px and
-                self.area_ratio_min < area_ratio < self.area_ratio_max
+                score >= self.trigger_conf
+                and dist < self.stable_dist_px
+                and self.area_ratio_min < area_ratio < self.area_ratio_max
             ):
                 self.stable_counter += 1
             else:
@@ -123,13 +167,18 @@ class GenericDetector:
         }
 
     def trigger_payload(self):
+        """Non-blocking GPIO pulse to release payload."""
         if not self.enable_payload_gpio:
-            print("Payload GPIO disabled")
+            print("[GenericDetector] Payload GPIO disabled — dry run only")
             return
-        print("TRIGGERING PAYLOAD")
-        GPIO.output(PAYLOAD_PIN, GPIO.HIGH)
-        time.sleep(PAYLOAD_PULSE_S)
-        GPIO.output(PAYLOAD_PIN, GPIO.LOW)
+
+        def _pulse():
+            print("[GenericDetector] TRIGGERING PAYLOAD on pin {}".format(PAYLOAD_PIN))
+            GPIO.output(PAYLOAD_PIN, GPIO.HIGH)
+            time.sleep(PAYLOAD_PULSE_S)
+            GPIO.output(PAYLOAD_PIN, GPIO.LOW)
+
+        threading.Thread(target=_pulse, daemon=True).start()
 
     def close(self):
         try:

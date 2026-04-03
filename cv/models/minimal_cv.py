@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#minimal_cv.py
 
 import cv2
 import numpy as np

@@ -1,3 +1,4 @@
+#lidar.py
 import serial
 import time
 import numpy as np
@@ -26,9 +27,10 @@ def check_connection():
     return ser.isOpen()
 
 
-def read_lidar_distance():
+def read_lidar_distance(timeout_s=0.5):
     global ser
-    while True:
+    start = time.time()
+    while time.time() - start < timeout_s:
         counter = ser.in_waiting
         if counter > 6:
             bytes_serial = ser.read(7)
@@ -38,6 +40,7 @@ def read_lidar_distance():
                 strength = bytes_serial[4] + bytes_serial[5] * 256
                 return distance / 100.0, strength
         time.sleep(0.005)
+    return None, None  # caller must handle this
 
 
 def read_lidar_temperature():
