@@ -201,3 +201,11 @@ def final_land():
         return False
     drone.land()
     return True
+
+
+def return_to_launch():
+    """Switch to ArduPilot RTL (return to home / launch)."""
+    if pilot_took_over():
+        return False
+    drone.return_to_launch_location()
+    return True
