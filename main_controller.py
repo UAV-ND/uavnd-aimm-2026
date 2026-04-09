@@ -27,6 +27,10 @@ from collections import deque
 
 sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026')
 sys.path.insert(1, '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026/modules')
+_repo = '/home/uav-nano/Documents/aimm-dev/uavnd-aimm-2026'
+sys.path.insert(1, _repo)
+sys.path.insert(1, _repo + '/modules')
+sys.path.insert(1, _repo + '/cv/models')
 
 import control
 from detector_adapter import GenericDetector
