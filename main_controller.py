@@ -118,6 +118,9 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
             log.info("%s: spiral timeout after %d legs", state_name, leg_num)
             return "timeout", None
 
+        if control.rc_manual_drop_requested():
+            control.stop_drone()
+            return "manual_drop", None
         if control.pilot_took_over():
             return "manual_override", None
 
@@ -142,6 +145,9 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
 
         leg_start = time.time()
         while time.time() - leg_start < SPIRAL_LEG_TIMEOUT_S:
+            if control.rc_manual_drop_requested():
+                control.stop_drone()
+                return "manual_drop", None
             if control.pilot_took_over():
                 return "manual_override", None
 
@@ -179,6 +185,9 @@ def _center_with_detector(detector, center_tol_x, center_tol_y,
     start          = time.time()
 
     while time.time() - start < timeout_s:
+        if control.rc_manual_drop_requested():
+            control.stop_drone()
+            return "manual_drop", None
         if control.pilot_took_over():
             return "manual_override", None
 
@@ -263,6 +272,7 @@ def wait_for_auto_start():
     control.wait_until_armed()
     load_payload_waypoint_from_fc()
     control.wait_for_auto_mode()
+    control.enable_manual_drop_via_rc(True)
     return "wait_for_handoff"
 
 
@@ -271,6 +281,8 @@ def wait_for_handoff():
     start = time.time()
 
     while time.time() - start < AUTO_MONITOR_TIMEOUT_S:
+        if control.rc_manual_drop_requested():
+            return "drop_payload"
         if control.pilot_took_over():
             return "manual_override"
 
@@ -302,7 +314,11 @@ def guided_handoff():
         return "manual_override"
 
     control.set_flight_altitude(GUIDED_HOLD_ALT)
-    control.hold_position(1.5)
+    hp = control.hold_position(1.5)
+    if hp == "manual_drop":
+        return "drop_payload"
+    if not hp:
+        return "manual_override"
     return "search_for_buoy"
 
 
@@ -320,6 +336,8 @@ def search_for_buoy(buoy_detector):
 
     if result == "found":
         return "center_on_buoy"
+    if result == "manual_drop":
+        return "drop_payload"
     if result == "manual_override":
         return "manual_override"
     log.info("search_for_buoy: buoy not found")
@@ -338,6 +356,8 @@ def center_on_buoy(buoy_detector):
         state_name    = "center_on_buoy"
     )
 
+    if result == "manual_drop":
+        return "drop_payload"
     if result == "manual_override":
         return "manual_override"
     if result == "ok":
@@ -348,6 +368,8 @@ def center_on_buoy(buoy_detector):
 def hold_at_buoy():
     log.info("hold_at_buoy: holding %.1fs", BUOY_HOLD_S)
     ok = control.hold_position(BUOY_HOLD_S)
+    if ok == "manual_drop":
+        return "drop_payload"
     if not ok:
         return "manual_override"
     return "search_for_payload"
@@ -367,6 +389,8 @@ def search_for_payload(payload_detector):
 
     if result == "found":
         return "center_payload_target"
+    if result == "manual_drop":
+        return "drop_payload"
     if result == "manual_override":
         return "manual_override"
     log.info("search_for_payload: target not found")
@@ -385,6 +409,8 @@ def center_payload_target(payload_detector):
         state_name    = "center_payload_target"
     )
 
+    if result == "manual_drop":
+        return "drop_payload"
     if result == "manual_override":
         return "manual_override"
     if result == "ok":
@@ -394,9 +420,6 @@ def center_payload_target(payload_detector):
 
 def drop_payload(payload_detector):
     log.info("drop_payload")
-    if control.pilot_took_over():
-        return "manual_override"
-
     payload_detector.trigger_payload()
     time.sleep(2.0)
     return "return_to_launch"
@@ -407,16 +430,22 @@ def return_to_launch():
     Command RTL; block until disarmed (landing complete) or timeout.
     """
     log.info("return_to_launch")
+    if control.rc_manual_drop_requested():
+        return "drop_payload"
     if control.pilot_took_over():
         return "manual_override"
 
     control.stop_drone()
     ok = control.return_to_launch()
+    if ok == "manual_drop":
+        return "drop_payload"
     if not ok:
         return "manual_override"
 
     start = time.time()
     while time.time() - start < RTL_WAIT_TIMEOUT_S:
+        if control.rc_manual_drop_requested():
+            return "drop_payload"
         if control.pilot_took_over():
             return "manual_override"
 
@@ -432,13 +461,19 @@ def return_to_launch():
     return "done"
 
 
-def manual_override():
-    log.info("manual_override: stopping drone")
+def manual_override(_payload_detector):
+    log.info(
+        "manual_override: stopping drone; waiting for RC ch%s payload command (no timeout)",
+        control.MANUAL_DROP_RC_CHANNEL,
+    )
     try:
         control.stop_drone()
     except Exception:
         pass
-    return "done"
+    while True:
+        if control.rc_manual_drop_requested():
+            return "drop_payload"
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +517,7 @@ def main():
                 STATE = return_to_launch()
 
             elif STATE == "manual_override":
-                STATE = manual_override()
+                STATE = manual_override(payload_detector)
 
             else:
                 log.error("Unknown state: %s", STATE)

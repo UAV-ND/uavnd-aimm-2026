@@ -4,6 +4,19 @@ from modules import drone
 from simple_pid import PID
 import time
 
+# RC channel for manual payload drop (PWM from FC over MAVLink). Enabled only after AUTO.
+MANUAL_DROP_RC_CHANNEL = "8"
+MANUAL_DROP_PWM_LOW = 982
+MANUAL_DROP_PWM_HIGH = 2006
+_MANUAL_PWM_MID = (MANUAL_DROP_PWM_LOW + MANUAL_DROP_PWM_HIGH) // 2
+MANUAL_DROP_HIGH_US = _MANUAL_PWM_MID + 200
+MANUAL_DROP_RESET_US = _MANUAL_PWM_MID - 200
+MANUAL_DROP_CONSEC_READS = 4
+
+_manual_drop_via_rc_enabled = False
+_manual_drop_rc_consec_high = 0
+_manual_drop_armed = True
+
 MAX_VEL_FORWARD = 1.0
 MAX_VEL_RIGHT = 1.0
 
@@ -45,7 +58,54 @@ def configure_PID(control="PID"):
 
 
 def connect_drone(drone_location):
+    enable_manual_drop_via_rc(False)
     return drone.connect_drone(drone_location)
+
+
+def enable_manual_drop_via_rc(enabled):
+    """Allow rc_manual_drop_requested() to return True (call after FC is in AUTO)."""
+    global _manual_drop_via_rc_enabled, _manual_drop_rc_consec_high, _manual_drop_armed
+    _manual_drop_via_rc_enabled = bool(enabled)
+    _manual_drop_rc_consec_high = 0
+    _manual_drop_armed = True
+
+
+def rc_manual_drop_requested():
+    """
+    True once per switch activation: PWM high for MANUAL_DROP_CONSEC_READS polls,
+    then false until RC returns near low (hysteresis).
+    """
+    global _manual_drop_rc_consec_high, _manual_drop_armed
+    if not _manual_drop_via_rc_enabled:
+        return False
+    try:
+        pwm = drone.read_channel(MANUAL_DROP_RC_CHANNEL)
+    except Exception:
+        return False
+    if pwm is None:
+        return False
+    try:
+        v = int(pwm)
+    except (TypeError, ValueError):
+        return False
+
+    if v < MANUAL_DROP_RESET_US:
+        _manual_drop_armed = True
+        _manual_drop_rc_consec_high = 0
+        return False
+
+    if v >= MANUAL_DROP_HIGH_US:
+        _manual_drop_rc_consec_high += 1
+    else:
+        _manual_drop_rc_consec_high = 0
+        return False
+
+    if _manual_drop_rc_consec_high >= MANUAL_DROP_CONSEC_READS and _manual_drop_armed:
+        _manual_drop_armed = False
+        _manual_drop_rc_consec_high = 0
+        print("RC manual payload drop requested (ch %s)" % MANUAL_DROP_RC_CHANNEL)
+        return True
+    return False
 
 
 def get_vehicle():
@@ -127,6 +187,8 @@ def goto_gps_location(lat, lon, alt, groundspeed=1.5, radius_m=2.0, timeout_s=90
 
     start = time.time()
     while time.time() - start < timeout_s:
+        if rc_manual_drop_requested():
+            return "manual_drop"
         if pilot_took_over():
             return False
         dist = drone.distance_to_waypoint(lat, lon)
@@ -166,6 +228,8 @@ def stop_drone():
 def hold_position(seconds=1.0):
     start = time.time()
     while time.time() - start < seconds:
+        if rc_manual_drop_requested():
+            return "manual_drop"
         if pilot_took_over():
             return False
         stop_drone()
@@ -197,6 +261,8 @@ def control_drone():
 
 
 def final_land():
+    if rc_manual_drop_requested():
+        return "manual_drop"
     if pilot_took_over():
         return False
     drone.land()
@@ -204,7 +270,9 @@ def final_land():
 
 
 def return_to_launch():
-    """Switch to ArduPilot RTL (return to home / launch)."""
+    """Switch to ArduPilot RTL (return to home / launch). Returns True / False / 'manual_drop'."""
+    if rc_manual_drop_requested():
+        return "manual_drop"
     if pilot_took_over():
         return False
     drone.return_to_launch_location()
