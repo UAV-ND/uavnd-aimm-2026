@@ -332,3 +332,43 @@ def get_mission_waypoint_by_index(index):
 def get_next_mission_index():
     global vehicle
     return getattr(vehicle.commands, "next", None)
+
+
+def send_statustext(text, severity=None):
+    """
+    STATUSTEXT to GCS (Mission Planner Messages tab). Text is truncated to 50 chars.
+    """
+    global vehicle
+    if vehicle is None:
+        return
+    if severity is None:
+        severity = mavutil.mavlink.MAV_SEVERITY_INFO
+    if isinstance(text, bytes):
+        text = text.decode("ascii", errors="replace")
+    text = str(text)[:50]
+    try:
+        msg = vehicle.message_factory.statustext_encode(severity, text)
+        vehicle.send_mavlink(msg)
+    except Exception as e:
+        print("[WARN] send_statustext failed: {}".format(e))
+
+
+def send_named_value_float(name, value, time_boot_ms=None):
+    """
+    NAMED_VALUE_FLOAT for HUD / tuning (name max 10 ASCII chars).
+    """
+    global vehicle
+    if vehicle is None:
+        return
+    if isinstance(name, bytes):
+        name = name.decode("ascii", errors="replace")
+    name = str(name)[:10]
+    if time_boot_ms is None:
+        time_boot_ms = int(time.time() * 1000) & 0xFFFFFFFF
+    try:
+        msg = vehicle.message_factory.named_value_float_encode(
+            time_boot_ms, name, float(value)
+        )
+        vehicle.send_mavlink(msg)
+    except Exception as e:
+        print("[WARN] send_named_value_float failed: {}".format(e))

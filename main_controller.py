@@ -33,6 +33,7 @@ sys.path.insert(1, _repo + '/modules')
 sys.path.insert(1, _repo + '/cv/models')
 
 import control
+import drone
 from detector_adapter import GenericDetector
 
 # =========================
@@ -155,6 +156,10 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
             if det is not None and det["has_target"]:
                 log.info("%s: detected on leg %d  conf=%.3f",
                          state_name, leg_num, det["confidence"])
+                if state_name == "search_for_buoy":
+                    drone.send_statustext("AIMM: buoy detected")
+                elif state_name == "search_for_payload":
+                    drone.send_statustext("AIMM: payload target detected")
                 control.stop_drone()
                 return "found", det
 
@@ -220,6 +225,10 @@ def _center_with_detector(detector, center_tol_x, center_tol_y,
         )
 
         if stable_counter >= stable_frames:
+            if state_name == "center_on_buoy":
+                drone.send_statustext("AIMM: buoy locked")
+            elif state_name == "center_payload_target":
+                drone.send_statustext("AIMM: payload locked")
             control.stop_drone()
             return "ok", det
 
@@ -484,12 +493,16 @@ def main():
     global STATE
     buoy_detector    = None
     payload_detector = None
+    prev_state       = None
 
     try:
         buoy_detector, payload_detector = setup()
         STATE = "wait_for_auto_start"
 
         while STATE != "done":
+            if STATE != prev_state:
+                drone.send_statustext("AIMM: {}".format(STATE))
+                prev_state = STATE
             log.info("── STATE: %-30s MODE: %s", STATE, control.get_mode())
 
             if   STATE == "wait_for_auto_start":
@@ -522,6 +535,9 @@ def main():
             else:
                 log.error("Unknown state: %s", STATE)
                 break
+
+        if STATE == "done":
+            drone.send_statustext("AIMM: done")
 
     except KeyboardInterrupt:
         log.info("Ctrl+C — stopping")
