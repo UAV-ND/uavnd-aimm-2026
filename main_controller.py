@@ -16,6 +16,18 @@
 #   return_to_launch          <- RTL mode (home), then wait for disarm
 #   manual_override
 #   done
+#
+# Bench checklist (Messages tab + main_controller.log, no traceback):
+#   1) AIMM: link OK -> AIMM: detectors ready
+#   2) After arm: AIMM: armed -> AIMM: dl mission -> Mission snapshot lines
+#      -> AIMM: n{count} cmd0/cmd1/cmd2 -> AIMM: WP ... -> AIMM: AUTO ready
+#      -> AIMM: RC drop armed
+#   3) In AUTO: AIMM: handoff n>=... -> AIMM: GUIDED hold -> search/center states
+#
+# Mission rows vs PAYLOAD_TARGET_MISSION_INDEX / HANDOFF_MISSION_INDEX:
+#   Use 0-based DroneKit order after download. MP "row 1" TAKEOFF + "row 2" WP
+#   only => indices 0 and 1 (waypoint = 1). If HOME is stored as item 0 in the
+#   downloaded list, waypoint shifts to index 2 — match constants to snapshot.
 
 
 import sys
@@ -32,23 +44,31 @@ sys.path.insert(1, _repo)
 sys.path.insert(1, _repo + '/modules')
 sys.path.insert(1, _repo + '/cv/models')
 
+from pymavlink import mavutil
+
 import control
 import drone
 from detector_adapter import GenericDetector
+
+
+def _gcs(msg, severity=None):
+    """STATUSTEXT to GCS; keep msg short (total truncated to 50 chars in drone layer)."""
+    drone.send_statustext(msg, severity=severity)
 
 # =========================
 # CONFIG
 # =========================
 UDP_CONNECTION = 'udpin:127.0.0.1:14552'
 
-PAYLOAD_TARGET_MISSION_INDEX = 2
-HANDOFF_MISSION_INDEX        = 2
+# 0-based DroneKit mission index of NAV_WAYPOINT (e.g. TAKEOFF=0, WP=1).
+PAYLOAD_TARGET_MISSION_INDEX = 1
+HANDOFF_MISSION_INDEX        = 1
 
 ENGINE_PATH = 'engine.engine'
 
 GUIDED_HOLD_ALT = 4.0
 
-SPIRAL_STEP_M        = 3.0
+SPIRAL_STEP_M        = 2.0
 SPIRAL_LEG_SPEED     = 1.0
 SPIRAL_MAX_LEGS      = 16
 SPIRAL_LEG_TIMEOUT_S = 30
@@ -117,6 +137,10 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
     for leg_num in range(SPIRAL_MAX_LEGS):
         if time.time() - start > timeout_s:
             log.info("%s: spiral timeout after %d legs", state_name, leg_num)
+            _gcs(
+                "AIMM: {} spiral tmo".format(state_name[:22]),
+                mavutil.mavlink.MAV_SEVERITY_WARNING,
+            )
             return "timeout", None
 
         if control.rc_manual_drop_requested():
@@ -157,9 +181,9 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
                 log.info("%s: detected on leg %d  conf=%.3f",
                          state_name, leg_num, det["confidence"])
                 if state_name == "search_for_buoy":
-                    drone.send_statustext("AIMM: buoy detected")
+                    _gcs("AIMM: buoy detected", mavutil.mavlink.MAV_SEVERITY_NOTICE)
                 elif state_name == "search_for_payload":
-                    drone.send_statustext("AIMM: payload target detected")
+                    _gcs("AIMM: payload seen", mavutil.mavlink.MAV_SEVERITY_NOTICE)
                 control.stop_drone()
                 return "found", det
 
@@ -178,6 +202,10 @@ def _run_spiral(detector, origin_lat, origin_lon, altitude, timeout_s, state_nam
             legs_at_this_length  = 0
 
     log.info("%s: spiral exhausted without detection", state_name)
+    _gcs(
+        "AIMM: {} no detect".format(state_name[:20]),
+        mavutil.mavlink.MAV_SEVERITY_WARNING,
+    )
     control.stop_drone()
     return "timeout", None
 
@@ -226,15 +254,19 @@ def _center_with_detector(detector, center_tol_x, center_tol_y,
 
         if stable_counter >= stable_frames:
             if state_name == "center_on_buoy":
-                drone.send_statustext("AIMM: buoy locked")
+                _gcs("AIMM: buoy locked", mavutil.mavlink.MAV_SEVERITY_NOTICE)
             elif state_name == "center_payload_target":
-                drone.send_statustext("AIMM: payload locked")
+                _gcs("AIMM: payload locked", mavutil.mavlink.MAV_SEVERITY_NOTICE)
             control.stop_drone()
             return "ok", det
 
         time.sleep(0.05)
 
     control.stop_drone()
+    _gcs(
+        "AIMM: {} center tmo".format(state_name[:20]),
+        mavutil.mavlink.MAV_SEVERITY_WARNING,
+    )
     return "timeout", None
 
 
@@ -247,6 +279,7 @@ def setup():
 
     log.info("Connecting to drone...")
     control.connect_drone(UDP_CONNECTION)
+    _gcs("AIMM: link OK", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     control.configure_PID("PID")
     control.set_flight_altitude(GUIDED_HOLD_ALT)
 
@@ -264,24 +297,44 @@ def setup():
         enable_payload_gpio=True
     )
 
+    _gcs("AIMM: detectors ready", mavutil.mavlink.MAV_SEVERITY_INFO)
     return buoy_detector, payload_detector
 
 
 def load_payload_waypoint_from_fc():
     global PAYLOAD_TARGET_WAYPOINT
     log.info("Downloading mission from FC...")
+    _gcs("AIMM: dl mission", mavutil.mavlink.MAV_SEVERITY_INFO)
+    mission_items = drone.list_mission_commands()
+    drone.emit_mission_head_snapshot(mission_items, log.info, _gcs)
     PAYLOAD_TARGET_WAYPOINT = control.get_target_waypoint_from_mission(
-        explicit_index=PAYLOAD_TARGET_MISSION_INDEX
+        explicit_index=PAYLOAD_TARGET_MISSION_INDEX,
+        mission_items=mission_items,
     )
     log.info("Payload waypoint: %s", PAYLOAD_TARGET_WAYPOINT)
+    wp = PAYLOAD_TARGET_WAYPOINT
+    try:
+        lat = float(wp["lat"])
+        lon = float(wp["lon"])
+        alt = float(wp["alt"])
+        idx = int(wp.get("seq", PAYLOAD_TARGET_MISSION_INDEX))
+        # STATUSTEXT payload max 50 chars
+        line = "AIMM: WP i{} a{:.0f} {:.4f},{:.4f}".format(idx, alt, lat, lon)
+        _gcs(line[:50], mavutil.mavlink.MAV_SEVERITY_NOTICE)
+    except (TypeError, ValueError, KeyError):
+        _gcs("AIMM: payload WP loaded", mavutil.mavlink.MAV_SEVERITY_NOTICE)
 
 
 def wait_for_auto_start():
     log.info("wait_for_auto_start")
+    _gcs("AIMM: waiting for auto start", mavutil.mavlink.MAV_SEVERITY_INFO)
     control.wait_until_armed()
+    _gcs("AIMM: armed", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     load_payload_waypoint_from_fc()
     control.wait_for_auto_mode()
+    _gcs("AIMM: AUTO ready", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     control.enable_manual_drop_via_rc(True)
+    _gcs("AIMM: RC drop armed", mavutil.mavlink.MAV_SEVERITY_INFO)
     return "wait_for_handoff"
 
 
@@ -305,28 +358,37 @@ def wait_for_handoff():
 
         if next_idx is not None and int(next_idx) >= int(HANDOFF_MISSION_INDEX):
             log.info("Handoff waypoint reached")
+            _gcs(
+                "AIMM: handoff n>={}".format(int(HANDOFF_MISSION_INDEX))[:50],
+                mavutil.mavlink.MAV_SEVERITY_NOTICE,
+            )
             return "guided_handoff"
 
         time.sleep(1.0)
 
     log.info("wait_for_handoff timeout")
+    _gcs("AIMM: handoff wait tmo", mavutil.mavlink.MAV_SEVERITY_WARNING)
     return "manual_override"
 
 
 def guided_handoff():
     log.info("guided_handoff")
     if control.pilot_took_over():
+        _gcs("AIMM: takeover b4 GUIDED", mavutil.mavlink.MAV_SEVERITY_WARNING)
         return "manual_override"
 
     ok = control.switch_to_guided()
     if not ok:
+        _gcs("AIMM: GUIDED failed", mavutil.mavlink.MAV_SEVERITY_ERROR)
         return "manual_override"
 
+    _gcs("AIMM: GUIDED hold", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     control.set_flight_altitude(GUIDED_HOLD_ALT)
     hp = control.hold_position(1.5)
     if hp == "manual_drop":
         return "drop_payload"
     if not hp:
+        _gcs("AIMM: hold abort", mavutil.mavlink.MAV_SEVERITY_WARNING)
         return "manual_override"
     return "search_for_buoy"
 
@@ -350,6 +412,7 @@ def search_for_buoy(buoy_detector):
     if result == "manual_override":
         return "manual_override"
     log.info("search_for_buoy: buoy not found")
+    _gcs("AIMM: no buoy", mavutil.mavlink.MAV_SEVERITY_WARNING)
     return "manual_override"
 
 
@@ -376,6 +439,7 @@ def center_on_buoy(buoy_detector):
 
 def hold_at_buoy():
     log.info("hold_at_buoy: holding %.1fs", BUOY_HOLD_S)
+    _gcs("AIMM: hold at buoy", mavutil.mavlink.MAV_SEVERITY_INFO)
     ok = control.hold_position(BUOY_HOLD_S)
     if ok == "manual_drop":
         return "drop_payload"
@@ -403,6 +467,7 @@ def search_for_payload(payload_detector):
     if result == "manual_override":
         return "manual_override"
     log.info("search_for_payload: target not found")
+    _gcs("AIMM: no payload tgt", mavutil.mavlink.MAV_SEVERITY_WARNING)
     return "manual_override"
 
 
@@ -429,6 +494,7 @@ def center_payload_target(payload_detector):
 
 def drop_payload(payload_detector):
     log.info("drop_payload")
+    _gcs("AIMM: DROP", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     payload_detector.trigger_payload()
     time.sleep(2.0)
     return "return_to_launch"
@@ -439,6 +505,7 @@ def return_to_launch():
     Command RTL; block until disarmed (landing complete) or timeout.
     """
     log.info("return_to_launch")
+    _gcs("AIMM: RTL", mavutil.mavlink.MAV_SEVERITY_NOTICE)
     if control.rc_manual_drop_requested():
         return "drop_payload"
     if control.pilot_took_over():
@@ -449,6 +516,7 @@ def return_to_launch():
     if ok == "manual_drop":
         return "drop_payload"
     if not ok:
+        _gcs("AIMM: RTL cmd failed", mavutil.mavlink.MAV_SEVERITY_WARNING)
         return "manual_override"
 
     start = time.time()
@@ -461,12 +529,14 @@ def return_to_launch():
         vehicle = control.get_vehicle()
         if not vehicle.armed:
             log.info("return_to_launch: disarmed — mission complete")
+            _gcs("AIMM: landed disarm", mavutil.mavlink.MAV_SEVERITY_NOTICE)
             return "done"
 
         log.info("return_to_launch: MODE=%s armed=%s", control.get_mode(), vehicle.armed)
         time.sleep(1.0)
 
     log.warning("return_to_launch: timeout after %ds (still armed)", RTL_WAIT_TIMEOUT_S)
+    _gcs("AIMM: RTL wait tmo", mavutil.mavlink.MAV_SEVERITY_WARNING)
     return "done"
 
 
@@ -475,6 +545,7 @@ def manual_override(_payload_detector):
         "manual_override: stopping drone; waiting for RC ch%s payload command (no timeout)",
         control.MANUAL_DROP_RC_CHANNEL,
     )
+    _gcs("AIMM: manual override", mavutil.mavlink.MAV_SEVERITY_WARNING)
     try:
         control.stop_drone()
     except Exception:
@@ -501,7 +572,10 @@ def main():
 
         while STATE != "done":
             if STATE != prev_state:
-                drone.send_statustext("AIMM: {}".format(STATE))
+                _gcs(
+                    "AIMM: {}".format(STATE)[:50],
+                    mavutil.mavlink.MAV_SEVERITY_INFO,
+                )
                 prev_state = STATE
             log.info("── STATE: %-30s MODE: %s", STATE, control.get_mode())
 
@@ -534,13 +608,18 @@ def main():
 
             else:
                 log.error("Unknown state: %s", STATE)
+                _gcs(
+                    "AIMM: bad state {}".format(STATE)[:50],
+                    mavutil.mavlink.MAV_SEVERITY_ERROR,
+                )
                 break
 
         if STATE == "done":
-            drone.send_statustext("AIMM: done")
+            _gcs("AIMM: done", mavutil.mavlink.MAV_SEVERITY_NOTICE)
 
     except KeyboardInterrupt:
         log.info("Ctrl+C — stopping")
+        _gcs("AIMM: stopped (user)", mavutil.mavlink.MAV_SEVERITY_WARNING)
         try:
             control.stop_drone()
         except Exception:
@@ -549,6 +628,11 @@ def main():
     except Exception as e:
         log.error("Mission failed: %s", e)
         log.error(traceback.format_exc())
+        err = str(e).replace("\n", " ")
+        _gcs(
+            "AIMM: {}".format(err)[:50],
+            mavutil.mavlink.MAV_SEVERITY_ERROR,
+        )
         try:
             control.stop_drone()
         except Exception:

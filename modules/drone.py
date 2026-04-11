@@ -1,8 +1,9 @@
 #drone.py
-from dronekit import connect, VehicleMode, LocationGlobalRelative
 import time
-from pymavlink import mavutil
 import math
+
+from dronekit import connect, VehicleMode, LocationGlobalRelative
+from pymavlink import mavutil
 
 vehicle = None
 
@@ -23,6 +24,12 @@ def connect_drone(connection_string, waitready=True, baudrate=None):
         print("[WARN] wait_ready minimal timed out: {}".format(e))
 
     print("drone connected")
+    try:
+        import mavlink_mission_int_shim
+        mavlink_mission_int_shim.install_mission_int_shim(vehicle)
+    except Exception as e:
+        print("[WARN] MISSION_REQUEST_INT shim not installed: {}".format(e))
+
     return vehicle
 
 
@@ -300,6 +307,32 @@ def list_mission_commands():
     return items
 
 
+def emit_mission_head_snapshot(items, log_fn, gcs_fn=None):
+    """
+    One-time log (and optional GCS) of mission size and MAV_CMD at indices 0..2.
+    log_fn: e.g. log.info with (msg, *args) style — use wrapper if needed.
+    gcs_fn: callable(message, severity=None) for STATUSTEXT.
+    """
+    n = len(items)
+    log_fn("Mission snapshot: total_items=%d", n)
+    for i in range(min(3, n)):
+        c = items[i]
+        log_fn(
+            "  mission[%d] mavlink_seq=%s command_id=%s",
+            i,
+            getattr(c, "seq", None),
+            c.command,
+        )
+    if gcs_fn is not None:
+        def cmd_str(j):
+            if j < n:
+                return str(int(items[j].command))
+            return "-"
+
+        line = "AIMM: n{} {}/{}/{}".format(n, cmd_str(0), cmd_str(1), cmd_str(2))
+        gcs_fn(line[:50], mavutil.mavlink.MAV_SEVERITY_NOTICE)
+
+
 def print_mission():
     cmds = list_mission_commands()
     print("===== Uploaded Mission =====")
@@ -309,8 +342,11 @@ def print_mission():
         ))
 
 
-def get_mission_waypoint_by_index(index):
-    cmds = list_mission_commands()
+def get_mission_waypoint_by_index(index, items=None):
+    if items is None:
+        cmds = list_mission_commands()
+    else:
+        cmds = items
 
     if index < 0 or index >= len(cmds):
         raise IndexError("Mission index {} out of range; mission has {} items".format(index, len(cmds)))

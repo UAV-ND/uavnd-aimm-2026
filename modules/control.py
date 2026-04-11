@@ -174,10 +174,10 @@ def switch_to_guided():
     return drone.get_mode() == "GUIDED"
 
 
-def get_target_waypoint_from_mission(explicit_index=None):
+def get_target_waypoint_from_mission(explicit_index=None, mission_items=None):
     if explicit_index is None:
         raise RuntimeError("explicit_index required")
-    wp = drone.get_mission_waypoint_by_index(explicit_index)
+    wp = drone.get_mission_waypoint_by_index(explicit_index, items=mission_items)
     print("Selected mission waypoint:", wp)
     return wp
 
